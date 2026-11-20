@@ -24,9 +24,9 @@ jobs:
         # "system" is the Python 3.9 that ships with macOS, which the app uses.
         python: ["system", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - if: matrix.python != 'system'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Run engine tests
@@ -40,7 +40,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build the menu bar app
         working-directory: app
         run: swift build
