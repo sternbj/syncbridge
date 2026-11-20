@@ -16,6 +16,9 @@ struct AISettingsView: View {
     @State private var claude: ClaudeCodeStatus?
     @State private var claudeAccounts: [ClaudeCodeStatus] = []
     @AppStorage(ClaudeCode.configFolderKey) private var claudeFolder = ""
+    @AppStorage(LocalModel.addressKey) private var localAddress = LocalModel.defaultAddress
+    @State private var localModels: [String] = []
+    @State private var localStatus: String?
 
     private var provider: AIProvider { AIProvider(rawValue: providerRaw) ?? .off }
 
@@ -41,6 +44,7 @@ struct AISettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
+            if provider == .local { localSection }
             if provider.needsKey {
                 Section(provider.label) {
                     TextField("Model", text: $model, prompt: Text(provider.modelHint))
@@ -54,9 +58,9 @@ struct AISettingsView: View {
                         Button("Save") { saveModel(); saveKey() }
                     }
                     Text("""
-                    Uses your own API key and is billed by \(provider.label). The key is stored in the macOS \
+                    Uses your own API key and is billed by \(provider.name). The key is stored in the macOS \
                     Keychain. When you ask for help, the text of both versions of that one file is sent to \
-                    \(provider.label). A ChatGPT Plus or Claude Pro subscription can't be used here; it needs an API key.
+                    \(provider.name). For a ChatGPT or Claude subscription, choose the subscription entry instead.
                     """)
                     .font(.caption).foregroundStyle(.secondary)
                 }
@@ -75,6 +79,76 @@ struct AISettingsView: View {
         .formStyle(.grouped)
         .onAppear(perform: refresh)
         .onChange(of: providerRaw) { _ in refresh() }
+    }
+
+    // MARK: Local model
+
+    private var localSection: some View {
+        Section("Local model") {
+            HStack {
+                TextField("Server address", text: $localAddress, prompt: Text(LocalModel.defaultAddress))
+                    .onSubmit { Task { await checkLocal() } }
+                Menu("Presets") {
+                    ForEach(LocalModel.servers, id: \.name) { server in
+                        Button("\(server.name) — \(server.address)") {
+                            localAddress = server.address
+                            Task { await checkLocal() }
+                        }
+                    }
+                }
+                .fixedSize()
+            }
+            if LocalModel.validURL(localAddress) == nil {
+                Text("Use an http:// address on this Mac or your local network, or any https:// address.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            HStack {
+                if localModels.isEmpty {
+                    TextField("Model", text: $model, prompt: Text("e.g. llama3.2 or qwen2.5"))
+                        .onSubmit(saveModel)
+                } else {
+                    Picker("Model", selection: $model) {
+                        Text("Choose…").tag("")
+                        ForEach(localModels, id: \.self) { Text($0).tag($0) }
+                        if !model.isEmpty, !localModels.contains(model) { Text(model).tag(model) }
+                    }
+                    .onChange(of: model) { _ in saveModel() }
+                }
+                Button("Check Server") { Task { await checkLocal() } }
+            }
+            if let localStatus { Text(localStatus).font(.caption).foregroundStyle(.secondary) }
+            SecureField(hasKey ? "API key (saved)" : "API key (only if your server needs one)", text: $key)
+                .onSubmit(saveKey)
+            Text("""
+            Runs on your own computer: file text stays on this Mac (or your network). Install Ollama \
+            from ollama.com and download a model in Terminal, e.g. `ollama pull llama3.2`, or start the \
+            server in LM Studio. Local models see only the first 6,000 characters of each version and \
+            may be slow on long files; a larger model gives better answers.
+            """)
+            .font(.caption).foregroundStyle(.secondary)
+        }
+        .task { await checkLocal() }
+    }
+
+    private func checkLocal() async {
+        guard let url = LocalModel.validURL(localAddress) else {
+            localModels = []
+            localStatus = nil
+            return
+        }
+        do {
+            localModels = try await LocalModel.models(at: url, key: KeychainStore.key(for: .local))
+            localStatus = localModels.isEmpty
+                ? "Connected. The server lists no models; type the model name."
+                : "Connected. \(localModels.count) model(s) found."
+            if model.isEmpty, let first = localModels.first {
+                model = first
+                saveModel()
+            }
+        } catch {
+            localModels = []
+            localStatus = error.localizedDescription
+        }
     }
 
     // MARK: Subscriptions

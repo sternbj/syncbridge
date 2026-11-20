@@ -6,19 +6,34 @@ import FoundationModels
 
 /// Where AI help for conflicts comes from. Cloud providers use the user's own API key.
 enum AIProvider: String, CaseIterable, Identifiable {
-    case off, chatgpt, claudeCode, apple, anthropic, openai, openrouter
+    case off, chatgpt, claudeCode, apple, local, anthropic, openai, openrouter
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .off: return "Off"
-        case .chatgpt: return "ChatGPT (your plan)"
-        case .claudeCode: return "Claude (your plan, via Claude Code)"
+        case .chatgpt: return "ChatGPT (subscription)"
+        case .claudeCode: return "Claude (subscription, via Claude Code)"
         case .apple: return "Apple (on this Mac)"
-        case .anthropic: return "Anthropic API key"
-        case .openai: return "OpenAI API key"
-        case .openrouter: return "OpenRouter key"
+        case .local: return "Local model (Ollama, LM Studio)"
+        case .anthropic: return "Anthropic (API key)"
+        case .openai: return "OpenAI (API key)"
+        case .openrouter: return "OpenRouter (API key)"
+        }
+    }
+
+    /// Short name for messages.
+    var name: String {
+        switch self {
+        case .chatgpt: return "ChatGPT"
+        case .claudeCode: return "Claude"
+        case .apple: return "Apple's model"
+        case .local: return "Your local model"
+        case .anthropic: return "Anthropic"
+        case .openai: return "OpenAI"
+        case .openrouter: return "OpenRouter"
+        case .off: return "AI"
         }
     }
 
@@ -28,6 +43,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .chatgpt, .openai: return "OpenAI"
         case .claudeCode, .anthropic: return "Anthropic"
         case .openrouter: return "OpenRouter"
+        case .local: return LocalModel.serverName
         default: return "nobody"
         }
     }
@@ -61,7 +77,14 @@ enum AIProvider: String, CaseIterable, Identifiable {
     }
 
     /// Apple's model has a small context window, so long files are cut shorter.
-    var maxCharsPerVersion: Int { self == .apple ? 5_000 : 60_000 }
+    /// Local models usually run with a context of a few thousand tokens.
+    var maxCharsPerVersion: Int {
+        switch self {
+        case .apple: return 5_000
+        case .local: return 6_000
+        default: return 60_000
+        }
+    }
 }
 
 /// API keys and sign-in sessions live in the macOS Keychain, never in the config or UserDefaults.
@@ -159,7 +182,7 @@ struct AIAssistant {
             return try await ClaudeCode.complete(system: system, prompt: prompt, model: Self.model(for: provider))
         case .apple:
             return try await completeWithApple(system: system, prompt: prompt)
-        case .anthropic, .openai, .openrouter:
+        case .anthropic, .openai, .openrouter, .local:
             return try await completeInCloud(system: system, prompt: prompt)
         }
     }
@@ -178,36 +201,34 @@ struct AIAssistant {
     }
 
     private func completeInCloud(system: String, prompt: String) async throws -> String {
-        guard let key = KeychainStore.key(for: provider) else {
-            throw AIError.notConfigured("Add your \(provider.label) API key in Settings › AI.")
+        let key = KeychainStore.key(for: provider)
+        if provider.needsKey, key == nil {
+            throw AIError.notConfigured("Add your \(provider.name) API key in Settings › AI.")
         }
         let model = Self.model(for: provider)
         guard !model.isEmpty else {
-            throw AIError.notConfigured("Enter a model name for \(provider.label) in Settings › AI.")
+            throw AIError.notConfigured("Choose a model for \(provider.name) in Settings › AI.")
         }
         var request: URLRequest
         let body: [String: Any]
         if provider == .anthropic {
             request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-            request.setValue(key, forHTTPHeaderField: "x-api-key")
+            request.setValue(key ?? "", forHTTPHeaderField: "x-api-key")
             request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             body = [
                 "model": model, "max_tokens": 16_000, "system": system,
                 "messages": [["role": "user", "content": prompt]],
             ]
         } else {
-            let endpoint = provider == .openai
-                ? "https://api.openai.com/v1/chat/completions"
-                : "https://openrouter.ai/api/v1/chat/completions"
-            request = URLRequest(url: URL(string: endpoint)!)
-            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            request = URLRequest(url: try chatCompletionsURL())
+            if let key { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
             body = [
                 "model": model,
                 "messages": [["role": "system", "content": system], ["role": "user", "content": prompt]],
             ]
         }
         request.httpMethod = "POST"
-        request.timeoutInterval = 180
+        request.timeoutInterval = provider == .local ? 600 : 180
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -216,7 +237,7 @@ struct AIAssistant {
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let detail = (json?["error"] as? [String: Any])?["message"] as? String
                 ?? String(data: data, encoding: .utf8)?.prefix(300).description ?? ""
-            throw AIError.failed("\(provider.label) returned an error: \(detail)")
+            throw AIError.failed("\(provider.name) returned an error: \(detail)")
         }
         let text: String?
         if provider == .anthropic {
@@ -226,8 +247,20 @@ struct AIAssistant {
         } else {
             text = ((json?["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String
         }
-        guard let text, !text.isEmpty else { throw AIError.failed("\(provider.label) returned no text.") }
+        guard let text, !text.isEmpty else { throw AIError.failed("\(provider.name) returned no text.") }
         return text
+    }
+
+    private func chatCompletionsURL() throws -> URL {
+        switch provider {
+        case .openai: return URL(string: "https://api.openai.com/v1/chat/completions")!
+        case .openrouter: return URL(string: "https://openrouter.ai/api/v1/chat/completions")!
+        default:
+            guard let base = LocalModel.baseURL else {
+                throw AIError.notConfigured("Enter your local model server's address in Settings › AI.")
+            }
+            return base.appendingPathComponent("chat/completions")
+        }
     }
 
     // MARK: Conflict prompts

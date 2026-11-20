@@ -61,6 +61,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSAppTransportSecurity</key>
+    <dict><key>NSAllowsLocalNetworking</key><true/></dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SyncBridge connects to a local AI model server (such as Ollama) only if you choose one in Settings › AI.</string>
 </dict>
 </plist>
 PLIST

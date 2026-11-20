@@ -14,21 +14,20 @@ struct AIInstructionsView: View {
             TextEditor(text: $trust.instructions)
                 .font(.body)
                 .frame(minHeight: 90)
-            Menu("Insert an Example") {
-                ForEach(AITrust.examples, id: \.self) { example in
-                    Button(example) { trust.addInstruction(example) }
-                }
-            }
-            .fixedSize()
         } header: {
             Text("Your instructions")
         } footer: {
-            Text("""
-            Tell the AI how to judge the content, one rule per line. Fixed rules (never delete in a \
-            folder, one person's changes win) work more reliably in Settings › Conflicts. When you \
-            overrule the AI, SyncBridge asks why and suggests a new instruction.
-            """)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("""
+                Tell the AI how to judge the content, one rule per line. Fixed rules (never delete in a \
+                folder, one person's changes win) work more reliably in Settings › Conflicts. When you \
+                overrule the AI, SyncBridge asks why and suggests a new instruction.
+                """)
+                Text("Examples:")
+                ForEach(AITrust.examples, id: \.self) { Text("• \($0)") }
+            }
             .font(.caption).foregroundStyle(.secondary)
+            .textSelection(.enabled)
         }
 
         Section {
