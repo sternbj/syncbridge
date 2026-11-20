@@ -15,7 +15,12 @@ final class AppModel: ObservableObject {
     @Published var isComparing = false
     /// AI suggestions per conflict, shared by the Conflicts window and Settings › AI.
     @Published var aiSuggestions: [Conflict.ID: AIDecision] = [:]
-    @Published var aiWorking = false
+    /// Progress of "Ask AI for All": how many conflicts are answered out of how many.
+    @Published var aiProgress: (done: Int, total: Int)?
+    /// The conflict the AI is looking at right now.
+    @Published var aiAsking: Conflict.ID?
+    @Published private(set) var aiStopRequested = false
+    var aiWorking: Bool { aiProgress != nil }
 
     static let realtimeKey = "realtimeSync"
     static let realtimeDelayKey = "realtimeDelaySeconds"
@@ -268,6 +273,8 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     func suggest(_ conflict: Conflict) async throws -> AIDecision {
+        aiAsking = conflict.id
+        defer { aiAsking = nil }
         let texts = try await loadConflictTexts(conflict)
         let decision = try await AIAssistant().decide(texts, local: conflict.local, onedrive: conflict.onedrive)
         aiSuggestions[conflict.id] = decision
@@ -276,13 +283,21 @@ final class AppModel: ObservableObject {
 
     /// Asks the AI about every open conflict it may decide; returns an error text if one failed.
     func suggestAll(limit: Int = 30) async -> String? {
-        aiWorking = true
-        defer { aiWorking = false }
-        for conflict in conflicts.filter(Self.aiCanDecide).prefix(limit) where aiSuggestions[conflict.id] == nil {
+        let queue = conflicts.filter(Self.aiCanDecide).prefix(limit).filter { aiSuggestions[$0.id] == nil }
+        guard !queue.isEmpty else { return nil }
+        aiStopRequested = false
+        aiProgress = (0, queue.count)
+        defer { aiProgress = nil }
+        for (index, conflict) in queue.enumerated() {
+            if aiStopRequested { return nil }
             do { try await suggest(conflict) } catch { return error.localizedDescription }
+            aiProgress = (index + 1, queue.count)
         }
         return nil
     }
+
+    /// Stops "Ask AI for All" after the answer it is waiting for.
+    func stopAI() { aiStopRequested = true }
 
     /// After a sync, with automatic decisions on: the AI resolves the conflicts it is sure about.
     private func decideAutomatically() async {

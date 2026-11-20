@@ -32,15 +32,17 @@ struct AIInstructionsView: View {
 
         Section {
             HStack {
-                Button(model.aiWorking ? "Asking AI…" : "Try on Open Conflicts") {
-                    Task {
-                        await model.loadConflicts()
-                        model.aiSuggestions = [:]
-                        tryError = await model.suggestAll()
+                if model.aiWorking {
+                    AIProgressView()
+                } else {
+                    Button("Try on Open Conflicts") {
+                        Task {
+                            await model.loadConflicts()
+                            model.aiSuggestions = [:]
+                            tryError = await model.suggestAll()
+                        }
                     }
                 }
-                .disabled(model.aiWorking)
-                if model.aiWorking { ProgressView().controlSize(.small) }
                 Spacer()
                 Button("Open Conflicts…") { model.show("conflicts") }
             }

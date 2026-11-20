@@ -68,11 +68,14 @@ struct ConflictsView: View {
             }
             .help("Uses the suggestion wherever it is clear (high or medium confidence). Conflicts that need a merge stay undecided.")
             if AIProvider(rawValue: aiProvider) ?? .off != .off {
-                Button(model.aiWorking ? "Asking AI…" : "Ask AI for All") {
-                    Task { if let error = await model.suggestAll() { result = "AI help failed: \(error)" } }
+                if model.aiWorking {
+                    AIProgressView()
+                } else {
+                    Button("Ask AI for All") {
+                        Task { if let error = await model.suggestAll() { result = "AI help failed: \(error)" } }
+                    }
+                    .help("Asks the AI about every conflict where both versions exist. Nothing is changed.")
                 }
-                .disabled(model.aiWorking)
-                .help("Asks the AI about every conflict where both versions exist. Nothing is changed.")
                 Button("Use AI Suggestions") {
                     decideAll { conflict in model.aiSuggestions[conflict.id].flatMap { $0.keep == "ask" ? nil : $0.keep } }
                 }
@@ -113,6 +116,7 @@ struct ConflictsView: View {
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
                 }
                 Spacer()
+                AIStatusMark(conflict: conflict)
                 if let keep = decisions[conflict.id] {
                     Text(conflict.keepBadge(keep))
                         .font(.caption.bold())
@@ -205,7 +209,10 @@ struct ConflictsView: View {
             HStack {
                 Text("AI help").font(.subheadline.bold())
                 Spacer()
-                if aiBusy == conflict.id { ProgressView().controlSize(.small) }
+                if aiBusy == conflict.id || model.aiAsking == conflict.id {
+                    ProgressView().controlSize(.small)
+                    Text("AI is reading both versions…").font(.caption).foregroundStyle(.secondary)
+                }
                 if provider == .off {
                     Button("Set Up AI…") {
                         model.settingsTab = "ai"
@@ -213,7 +220,7 @@ struct ConflictsView: View {
                     }
                 } else {
                     Button("Ask AI") { Task { await askAI(conflict) } }
-                        .disabled(aiBusy != nil || !AppModel.aiCanDecide(conflict))
+                        .disabled(aiBusy != nil || model.aiWorking || !AppModel.aiCanDecide(conflict))
                         .help(AppModel.aiCanDecide(conflict) ? "" : "Deletions and name conflicts are always yours to decide.")
                     if conflict.analysis?.mergeable == true {
                         Button("Propose Merge…") { Task { await proposeMerge(conflict) } }

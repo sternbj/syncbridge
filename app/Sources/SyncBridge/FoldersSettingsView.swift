@@ -145,8 +145,14 @@ struct PairEditor: View {
                 }
             }
             Section("Filter") {
-                filterEditor("Include (empty = everything)", text: $pair.include)
-                filterEditor("Exclude", text: $pair.exclude)
+                filterEditor(
+                    "Include", hint: "Only matching files are synced. Leave empty to sync everything.",
+                    text: $pair.include
+                )
+                filterEditor(
+                    "Exclude", hint: "Matching files and folders are skipped, even if they match Include.",
+                    text: $pair.exclude
+                )
                 LabeledContent("File size") {
                     HStack {
                         TextField("min", value: $pair.minSizeMB, format: .number).frame(width: 70)
@@ -161,8 +167,7 @@ struct PairEditor: View {
                         Text("days (0 = any time)").foregroundStyle(.secondary)
                     }
                 }
-                Text("Patterns are relative to the pair, e.g. Projects/** or *.mov. Filtered files are left alone on both sides, never deleted.")
-                    .font(.caption).foregroundStyle(.secondary)
+                DisclosureGroup("How filters work") { FilterHelp() }
             }
             Section {
                 HStack {
@@ -238,9 +243,10 @@ struct PairEditor: View {
         }
     }
 
-    private func filterEditor(_ title: String, text: Binding<String>) -> some View {
+    private func filterEditor(_ title: String, hint: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading) {
             Text(title)
+            Text(hint + " One pattern per line.").font(.caption).foregroundStyle(.secondary)
             TextEditor(text: text)
                 .font(.system(.body, design: .monospaced))
                 .frame(height: 44)
@@ -258,4 +264,44 @@ func chooseFolder(title: String, startIn: URL? = nil) -> String? {
     panel.directoryURL = startIn
     guard panel.runModal() == .OK, let url = panel.url else { return nil }
     return (url.path as NSString).abbreviatingWithTildeInPath
+}
+
+/// The filter rules in plain words, with examples that match how the engine reads patterns.
+private struct FilterHelp: View {
+    private static let examples: [(pattern: String, meaning: String)] = [
+        ("*.docx", "Word files in this folder and every subfolder"),
+        ("Projects/**", "everything in the top-level folder Projects"),
+        ("**/Archive/**", "everything in any folder named Archive, at any depth"),
+        ("Archive", "the top-level folder Archive (as Exclude, skips all of it)"),
+        ("*.mov", "videos anywhere, e.g. to keep large files out"),
+        ("Report ????.xlsx", "? stands for exactly one character, e.g. Report 2026.xlsx"),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("""
+            Patterns are paths inside this pair, written with / between folders. * matches any \
+            characters, including across folders, so *.pdf finds PDFs everywhere. ** before or after \
+            a folder name means "any folders". Upper and lower case count: *.docx does not match \
+            REPORT.DOCX.
+            """)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                ForEach(Self.examples, id: \.pattern) { example in
+                    GridRow {
+                        Text(example.pattern).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text(example.meaning)
+                    }
+                }
+            }
+            Text("""
+            Exclude always wins over Include. File size and "Changed within" apply on top: a file \
+            must pass every filter. Filtered files are left alone on both sides: never copied, never \
+            deleted. Files synced before you added a filter stay where they are.
+            """)
+            Text(".DS_Store, Office lock files (~$…) and temporary files (.tmp) are always skipped; see Settings › Exclusions.")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.top, 4)
+    }
 }
