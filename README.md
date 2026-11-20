@@ -75,6 +75,10 @@ deletions, and stops to ask whenever something could lose data.
 
 ## Install
 
+**Download for Apple Silicon (macOS 13+):** [SyncBridge 1.0.0 disk image](https://github.com/sternbj/syncbridge/releases/tag/v1.0.0). Open the `.dmg` and drag SyncBridge to Applications. This installer preview is not Apple-notarized, so macOS may show a warning at first launch. The release page includes the SHA-256 checksum, build recipe and matching source.
+
+### Build from source
+
 ```bash
 git clone https://github.com/sternbj/syncbridge.git
 cd syncbridge
