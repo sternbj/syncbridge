@@ -1,0 +1,20 @@
+name: Idea or suggestion
+description: Suggest a feature or an improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: What would you like SyncBridge to do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why would it help?
+      description: The situation where you would use it.
+  - type: input
+    id: version
+    attributes:
+      label: SyncBridge and macOS version

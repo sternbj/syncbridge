@@ -1,0 +1,17 @@
+{
+  "pairs": [
+    {
+      "name": "Documents",
+      "local": "~/Documents",
+      "onedrive": "~/Library/CloudStorage/OneDrive-Personal/Documents"
+    }
+  ],
+  "conflict_rule": "ask",
+  "auto_delete_limit": 50,
+  "trash_retention_days": 30,
+  "sync_interval_minutes": 60,
+  "exclude_dirs": ["tmp", ".tmp"],
+  "exclude_path_patterns": [],
+  "exclude_names": [],
+  "staged_exclude_path_patterns": []
+}

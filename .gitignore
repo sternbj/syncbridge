@@ -1,0 +1,12 @@
+# Build output
+.build/
+build-cache/
+build/
+*.app
+
+# Personal configuration and sync state never belong in the repo
+config.json
+state/
+*.log
+__pycache__/
+.DS_Store
