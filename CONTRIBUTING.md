@@ -14,4 +14,7 @@ Bug reports, ideas and pull requests are welcome.
 - Tests come first for engine changes: `cd engine && python3 -m unittest discover tests`
 - Build and install the app: `scripts/install.sh`
 
+Every pull request runs the engine tests (with the Python 3.9 that ships with macOS and with
+Python 3.13) and builds the app on GitHub. A pull request is merged only when these checks pass.
+
 Keep changes small and focused, and describe in the pull request what you tested.

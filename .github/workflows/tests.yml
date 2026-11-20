@@ -1,0 +1,46 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: Engine tests (Python ${{ matrix.python }})
+    runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # "system" is the Python 3.9 that ships with macOS, which the app uses.
+        python: ["system", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.python != 'system'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run engine tests
+        run: |
+          PYTHON=$([ "${{ matrix.python }}" = system ] && echo /usr/bin/python3 || echo python3)
+          $PYTHON --version
+          $PYTHON -m unittest discover -s engine/tests -v
+
+  app:
+    name: App builds
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the menu bar app
+        working-directory: app
+        run: swift build

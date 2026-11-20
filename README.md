@@ -1,5 +1,7 @@
 # SyncBridge
 
+[![Tests](https://github.com/sternbj/syncbridge/actions/workflows/tests.yml/badge.svg)](https://github.com/sternbj/syncbridge/actions/workflows/tests.yml)
+
 A macOS menu bar app that keeps local folders and cloud folders (OneDrive, iCloud Drive,
 Dropbox, Google Drive — anything under `~/Library/CloudStorage`) in sync — safely.
 
