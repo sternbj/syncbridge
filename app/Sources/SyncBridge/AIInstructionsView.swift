@@ -14,6 +14,7 @@ struct AIInstructionsView: View {
             TextEditor(text: $trust.instructions)
                 .font(.body)
                 .frame(minHeight: 90)
+                .onChange(of: trust.instructions) { _ in model.refreshSuggestions() }
         } header: {
             Text("Your instructions")
         } footer: {
@@ -38,13 +39,12 @@ struct AIInstructionsView: View {
                     Button("Try on Open Conflicts") {
                         Task {
                             await model.loadConflicts()
-                            model.aiSuggestions = [:]
                             tryError = await model.suggestAll()
                         }
                     }
                 }
                 Spacer()
-                Button("Open Conflicts…") { model.show("conflicts") }
+                OpenConflictsButton()
             }
             if let tryError { Text("AI help failed: \(tryError)").font(.caption).foregroundStyle(.red) }
             ForEach(model.conflicts.filter { model.aiSuggestions[$0.id] != nil }) { conflict in
@@ -64,8 +64,9 @@ struct AIInstructionsView: View {
             Text("Test your instructions")
         } footer: {
             Text("""
-            Shows what the AI would do with your open conflicts. Nothing is changed. Edit the \
-            instructions and try again until the answers match what you would do; then decide in \
+            Shows what the AI would do with your open conflicts. Nothing is changed. Answers are \
+            kept until a file or your instructions change, so after editing the instructions, try \
+            again until the answers match what you would do; then decide in \
             the Conflicts window, where "Use AI Suggestions" fills in its choices for you to check.
             """ + (provider.isCloud ? " The text of each file is sent to \(provider.serviceName)." : ""))
             .font(.caption).foregroundStyle(.secondary)

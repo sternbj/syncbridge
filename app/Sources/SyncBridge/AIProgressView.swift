@@ -11,21 +11,24 @@ struct AIProgressView: View {
                 ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
                     .frame(width: 80)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(model.aiStopRequested ? "Stopping after this file…" : "Asking AI… \(progress.done) of \(progress.total)")
-                        .monospacedDigit()
-                    if let file = currentFile {
-                        Text(file).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    Text(model.aiStopRequested ? "Stopping…" : "Asking AI… \(progress.done) of \(progress.total)")
+                        .monospacedDigit().lineLimit(1).fixedSize()
+                    if !currentFiles.isEmpty {
+                        Text(currentFiles).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            .frame(maxWidth: 260, alignment: .leading)
                     }
                 }
                 Button("Stop") { model.stopAI() }
                     .disabled(model.aiStopRequested)
-                    .help("Stops after the answer the AI is working on. Suggestions so far are kept.")
+                    .help("Starts no further files. Answers already given are kept.")
             }
         }
     }
 
-    private var currentFile: String? {
-        model.conflicts.first { $0.id == model.aiAsking }.map { ($0.file as NSString).lastPathComponent }
+    /// "Report.docx, Plan.xlsx"
+    private var currentFiles: String {
+        model.conflicts.filter { model.aiAsking.contains($0.id) }
+            .map { ($0.file as NSString).lastPathComponent }.joined(separator: ", ")
     }
 }
 
@@ -35,12 +38,26 @@ struct AIStatusMark: View {
     let conflict: Conflict
 
     var body: some View {
-        if model.aiAsking == conflict.id {
+        if model.aiAsking.contains(conflict.id) {
             ProgressView().controlSize(.small).help("The AI is looking at this file.")
         } else if let suggestion = model.aiSuggestions[conflict.id] {
             Image(systemName: "sparkles")
                 .foregroundStyle(suggestion.keep == "ask" ? Color.secondary : Color.accentColor)
                 .help("AI suggests: \(suggestion.title)")
         }
+    }
+}
+
+/// Opens the Conflicts window; shows how many conflicts are open.
+struct OpenConflictsButton: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        let count = model.status?.conflicts ?? 0
+        Button { model.show("conflicts") } label: {
+            Label(count > 0 ? "Open Conflicts (\(count))…" : "Open Conflicts…",
+                  systemImage: count > 0 ? "exclamationmark.triangle" : "arrow.triangle.branch")
+        }
+        .help("Shows every file that changed on both sides, where you decide which version to keep.")
     }
 }

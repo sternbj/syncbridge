@@ -30,6 +30,7 @@ struct SettingsView: View {
             }
             Divider()
             HStack {
+                OpenConflictsButton()
                 if !errors.isEmpty {
                     Text(errors.joined(separator: "\n")).foregroundStyle(.red).font(.caption)
                 } else if saved {
@@ -45,6 +46,7 @@ struct SettingsView: View {
         }
         .frame(minWidth: 760, minHeight: 480)
         .task { await load() }
+        .modifier(StarPromptModifier())
     }
 
     // MARK: Sections
@@ -56,6 +58,7 @@ struct SettingsView: View {
         ("exclusions", "Exclusions", "eye.slash"),
         ("ai", "AI", "sparkles"),
         ("general", "Schedule & General", "gearshape"),
+        ("feedback", "Help & Feedback", "bubble.left.and.bubble.right"),
     ]
 
     @ViewBuilder private func page(_ tag: String) -> some View {
@@ -65,12 +68,20 @@ struct SettingsView: View {
         case "exclusions": exclusionsTab
         case "ai": AISettingsView()
         case "general": generalTab
+        case "feedback": FeedbackSettingsView()
         default: FoldersSettingsView(pairs: $draft.pairs)
         }
     }
 
     private var conflictsTab: some View {
         Form {
+            Section {
+                HStack {
+                    Text(openConflictsText)
+                    Spacer()
+                    OpenConflictsButton()
+                }
+            }
             RulesSettingsView(draft: $draft)
             Section("Everything else") {
                 Picker("When a file changed on both sides", selection: $draft.conflictRule) {
@@ -91,6 +102,11 @@ struct SettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private var openConflictsText: String {
+        let count = model.status?.conflicts ?? 0
+        return count == 0 ? "No open conflicts." : "\(count) conflict(s) wait for your decision."
     }
 
     private var deletionsTab: some View {

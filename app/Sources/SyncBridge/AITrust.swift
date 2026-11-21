@@ -18,6 +18,19 @@ struct AIDecision: Codable, Hashable {
     }
 }
 
+/// An AI answer kept on disk, valid while both file versions and the instructions stay the same.
+struct SavedSuggestion: Codable {
+    var decision: AIDecision
+    var local: FileVersion?
+    var onedrive: FileVersion?
+    var instructions: String
+
+    func fits(_ conflict: Conflict) -> Bool {
+        local == conflict.local && onedrive == conflict.onedrive
+            && instructions == AITrust.fingerprint(AITrust.currentInstructions)
+    }
+}
+
 /// One conflict where the user decided after seeing the AI's suggestion.
 struct AIRecord: Codable {
     var date: Date
@@ -73,9 +86,18 @@ final class AITrust: ObservableObject {
             .prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static var fileURL: URL {
+    private static var fileURL: URL { supportFile("ai-decisions.json") }
+
+    /// A file in ~/Library/Application Support/SyncBridge.
+    nonisolated static func supportFile(_ name: String) -> URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("SyncBridge/ai-decisions.json")
+            .appendingPathComponent("SyncBridge/\(name)")
+    }
+
+    /// Writes JSON next to the app's other files; failures only cost a cache or a statistic.
+    nonisolated static func save<T: Encodable>(_ value: T, to url: URL) {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? JSONEncoder().encode(value).write(to: url, options: .atomic)
     }
 
     /// Records that count: the last 30 days, made with the current instructions.
@@ -135,10 +157,7 @@ final class AITrust: ObservableObject {
         }
         guard !new.isEmpty else { return [] }
         records = Array((records + new).suffix(5_000))
-        try? FileManager.default.createDirectory(
-            at: Self.fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        try? JSONEncoder().encode(records).write(to: Self.fileURL, options: .atomic)
+        Self.save(records, to: Self.fileURL)
         let disagreements = new.filter { !$0.agreed }
         if !disagreements.isEmpty { autoDecide = false }
         return disagreements.map { ($0.file, $0.ai, $0.user) }

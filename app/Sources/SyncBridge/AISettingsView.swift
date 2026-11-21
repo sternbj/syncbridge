@@ -57,7 +57,7 @@ struct AISettingsView: View {
                         if hasKey { Button("Remove Key") { KeychainStore.setKey("", for: provider); refresh() } }
                         Button("Save") { saveModel(); saveKey() }
                     }
-                    Text("""
+                    Text(provider == .jev ? Self.jevNote : """
                     Uses your own API key and is billed by \(provider.name). The key is stored in the macOS \
                     Keychain. When you ask for help, the text of both versions of that one file is sent to \
                     \(provider.name). For a ChatGPT or Claude subscription, choose the subscription entry instead.
@@ -311,6 +311,14 @@ struct AISettingsView: View {
         }
     }
 
+    static let jevNote = """
+    Jev answers in about a second and costs a fraction of a cent per file. It only picks a version \
+    and says how sure it is, without reasons; below \(Int(Jev.minimumProbability * 100))% it leaves the \
+    file to you. It can't merge or suggest instructions. It uses your OpenRouter key (shared with the \
+    OpenRouter entry), stored in the macOS Keychain, and the text of both versions is sent to \
+    OpenRouter and TypeSafe in the US.
+    """
+
     private func saveModel() {
         UserDefaults.standard.set(model.trimmingCharacters(in: .whitespaces), forKey: AIAssistant.modelKeyPrefix + provider.rawValue)
     }
@@ -328,6 +336,16 @@ struct AISettingsView: View {
         testing = true
         defer { testing = false }
         do {
+            if provider == .jev {
+                let start = Date()
+                let decision = try await Jev.decide(
+                    state: "=== LAPTOP VERSION ===\nMeeting at 10.\n=== ONEDRIVE VERSION ===\nMeeting at 10. Bring the report.",
+                    instructions: "", model: AIAssistant.model(for: provider), key: KeychainStore.key(for: provider) ?? ""
+                )
+                let seconds = Date().timeIntervalSince(start).formatted(.number.precision(.fractionLength(1)))
+                testResult = "Connected in \(seconds) s. Test answer: \(decision.reason)"
+                return
+            }
             let answer = try await AIAssistant(provider: provider).complete(
                 system: "Reply with exactly: OK", prompt: "Connection test"
             )

@@ -47,7 +47,13 @@ deletions, and stops to ask whenever something could lose data.
   - **ChatGPT plan** (Go, Plus, Pro) via OpenAI's "Sign in with ChatGPT" for open-source apps
   - **Claude plan** (Pro, Max) via your own signed-in Claude Code, run with all tools off;
     several accounts in `~/.claude*` folders can be picked
+  - **Local model** (Ollama, LM Studio, llama.cpp) on this Mac or your network
+  - **Jev** by TypeSafe through an OpenRouter key: picks a version in about a second with a
+    probability, but gives no reasons and can't merge; below 80% it leaves the file to you
   - Apple's on-device model, or an Anthropic, OpenAI or OpenRouter API key
+
+  "Ask AI for All" asks about a few files at once, keeps the answers until a file or your
+  instructions change, and sends a notification when a long run is done.
 
   Sign-ins and keys are stored in the Keychain. The subscription approach follows the
   open-source PDF reader [Folio](https://github.com/Forward-Future/folio).
@@ -161,9 +167,9 @@ safety rules live in `engine/syncbridge.py` and are covered by the tests.
 
 ## Feedback and contributing
 
-Found a bug or have an idea? Use **Help › Report a Bug…** or **Suggest an Idea…** in the app, or open an
+Found a bug or have an idea? Use **Settings › Help & Feedback** (or the Help menu) in the app, or open an
 [issue](https://github.com/sternbj/syncbridge/issues/new/choose). Pull requests are welcome — see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](CONTRIBUTING.md). If SyncBridge is useful to you, a star on GitHub helps others find it.
 
 ## License
 

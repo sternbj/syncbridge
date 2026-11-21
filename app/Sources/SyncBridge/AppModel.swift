@@ -17,9 +17,15 @@ final class AppModel: ObservableObject {
     @Published var aiSuggestions: [Conflict.ID: AIDecision] = [:]
     /// Progress of "Ask AI for All": how many conflicts are answered out of how many.
     @Published var aiProgress: (done: Int, total: Int)?
-    /// The conflict the AI is looking at right now.
-    @Published var aiAsking: Conflict.ID?
+    /// The conflicts the AI is looking at right now.
+    @Published var aiAsking: Set<Conflict.ID> = []
+    /// Every AI answer, kept across restarts; aiSuggestions shows those still valid.
+    private var savedSuggestions: [Conflict.ID: SavedSuggestion] =
+        (try? JSONDecoder().decode([Conflict.ID: SavedSuggestion].self,
+                                   from: Data(contentsOf: AITrust.supportFile("ai-suggestions.json")))) ?? [:]
     @Published private(set) var aiStopRequested = false
+    private var aiQueue: [Conflict] = []
+    private var aiFailure: String?
     var aiWorking: Bool { aiProgress != nil }
 
     static let realtimeKey = "realtimeSync"
@@ -182,6 +188,7 @@ final class AppModel: ObservableObject {
                     try await engine.run(arguments + ["--overrides", path])
                 }
             Engine.notifications(in: output).forEach(post)
+            StarPrompt.syncSucceeded()
         } catch {
             message = error.localizedDescription
         }
@@ -251,6 +258,9 @@ final class AppModel: ObservableObject {
     func loadConflicts() async {
         do {
             conflicts = try await engine.decode([Conflict].self, ["--list-conflicts"])
+            let open = Set(conflicts.map(\.id))
+            savedSuggestions = savedSuggestions.filter { open.contains($0.key) }
+            refreshSuggestions()
         } catch {
             message = error.localizedDescription
         }
@@ -271,39 +281,74 @@ final class AppModel: ObservableObject {
         conflict.local != nil && conflict.onedrive != nil && !conflict.isNameConflict
     }
 
+    /// Shows the saved answers that still fit: same file versions, same instructions.
+    func refreshSuggestions() {
+        aiSuggestions = Dictionary(uniqueKeysWithValues: conflicts.compactMap { conflict in
+            savedSuggestions[conflict.id].flatMap { $0.fits(conflict) ? (conflict.id, $0.decision) : nil }
+        })
+    }
+
     @discardableResult
     func suggest(_ conflict: Conflict) async throws -> AIDecision {
-        aiAsking = conflict.id
-        defer { aiAsking = nil }
+        aiAsking.insert(conflict.id)
+        defer { aiAsking.remove(conflict.id) }
         let texts = try await loadConflictTexts(conflict)
         let decision = try await AIAssistant().decide(texts, local: conflict.local, onedrive: conflict.onedrive)
         aiSuggestions[conflict.id] = decision
+        savedSuggestions[conflict.id] = SavedSuggestion(
+            decision: decision, local: conflict.local, onedrive: conflict.onedrive,
+            instructions: AITrust.fingerprint(AITrust.currentInstructions)
+        )
+        AITrust.save(savedSuggestions, to: AITrust.supportFile("ai-suggestions.json"))
         return decision
     }
 
-    /// Asks the AI about every open conflict it may decide; returns an error text if one failed.
-    func suggestAll(limit: Int = 30) async -> String? {
-        let queue = conflicts.filter(Self.aiCanDecide).prefix(limit).filter { aiSuggestions[$0.id] == nil }
+    /// Asks the AI about every open conflict it may decide, a few at a time, skipping those it
+    /// already answered. Returns an error text if one failed; then no further files are started.
+    /// notify: a notification says when a long run is done.
+    func suggestAll(limit: Int = 30, notify: Bool = true) async -> String? {
+        let queue = conflicts.filter(Self.aiCanDecide).filter { aiSuggestions[$0.id] == nil }.prefix(limit)
         guard !queue.isEmpty else { return nil }
+        let started = Date()
         aiStopRequested = false
         aiProgress = (0, queue.count)
         defer { aiProgress = nil }
-        for (index, conflict) in queue.enumerated() {
-            if aiStopRequested { return nil }
-            do { try await suggest(conflict) } catch { return error.localizedDescription }
-            aiProgress = (index + 1, queue.count)
+        aiQueue = Array(queue)
+        aiFailure = nil
+        let workers = (0..<AIAssistant.provider.parallelRequests).map { _ in Task { await aiWorker() } }
+        for worker in workers { await worker.value }
+        let failure = aiFailure
+        if notify, let failure, Date().timeIntervalSince(started) > 20 {
+            post(EngineNotification(title: "AI help stopped", message: failure, open: "conflicts"))
+        } else if notify, Date().timeIntervalSince(started) > 20 {
+            let unsure = queue.filter { aiSuggestions[$0.id]?.keep == "ask" }.count
+            post(EngineNotification(
+                title: "AI suggestions ready",
+                message: "The AI answered \(aiProgress?.done ?? queue.count) conflict(s)" + (unsure > 0 ? "; \(unsure) it left for you." : ".")
+                    + " Check them in the Conflicts window.",
+                open: "conflicts"
+            ))
         }
-        return nil
+        return failure
     }
 
-    /// Stops "Ask AI for All" after the answer it is waiting for.
+    /// Takes the next waiting conflict until none are left, the user stops or one fails.
+    private func aiWorker() async {
+        while !aiStopRequested, aiFailure == nil, !aiQueue.isEmpty {
+            let conflict = aiQueue.removeFirst()
+            do { try await suggest(conflict) } catch { aiFailure = aiFailure ?? error.localizedDescription }
+            if let progress = aiProgress { aiProgress = (progress.done + 1, progress.total) }
+        }
+    }
+
+    /// Stops "Ask AI for All" after the answers it is waiting for.
     func stopAI() { aiStopRequested = true }
 
     /// After a sync, with automatic decisions on: the AI resolves the conflicts it is sure about.
     private func decideAutomatically() async {
         let trust = AITrust.shared
         guard trust.autoDecide, trust.isEligible, AIAssistant.provider != .off, !conflicts.isEmpty else { return }
-        _ = await suggestAll()
+        _ = await suggestAll(notify: false)
         let batch = conflicts.filter(Self.aiCanDecide).compactMap { conflict -> ConflictDecision? in
             guard let keep = aiSuggestions[conflict.id]?.keep, keep != "ask" else { return nil }
             return ConflictDecision(pair: conflict.pair, file: conflict.file, keep: keep)

@@ -50,46 +50,52 @@ struct ConflictsView: View {
 
     // MARK: Bulk actions
 
+    private var aiOn: Bool { AIProvider(rawValue: aiProvider) ?? .off != .off }
+
     private var bulkBar: some View {
-        HStack {
-            Text("\(model.conflicts.count) open conflict(s)").font(.headline)
-            if !realtime {
-                Button("Fewer conflicts: sync when files change") {
-                    model.settingsTab = "general"
-                    model.show("settings")
-                }
-                .buttonStyle(.link)
-                .help("Opens Settings › Schedule & General, where you turn on syncing when files change and choose how often to sync.")
-            }
-            Spacer()
-            Text("For all:").foregroundStyle(.secondary)
-            Button("Keep Suggested") {
-                decideAll { $0.analysis?.confidence == "low" ? nil : $0.analysis?.keepSide }
-            }
-            .help("Uses the suggestion wherever it is clear (high or medium confidence). Conflicts that need a merge stay undecided.")
-            if AIProvider(rawValue: aiProvider) ?? .off != .off {
-                if model.aiWorking {
-                    AIProgressView()
-                } else {
-                    Button("Ask AI for All") {
-                        Task { if let error = await model.suggestAll() { result = "AI help failed: \(error)" } }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("\(model.conflicts.count) open conflict(s)").font(.headline).fixedSize()
+                if !realtime {
+                    Button("Fewer conflicts: sync when files change") {
+                        model.settingsTab = "general"
+                        model.show("settings")
                     }
-                    .help("Asks the AI about every conflict where both versions exist. Nothing is changed.")
+                    .buttonStyle(.link)
+                    .help("Opens Settings › Schedule & General, where you turn on syncing when files change and choose how often to sync.")
                 }
-                Button("Use AI Suggestions") {
-                    decideAll { conflict in model.aiSuggestions[conflict.id].flatMap { $0.keep == "ask" ? nil : $0.keep } }
-                }
-                .disabled(model.aiSuggestions.isEmpty)
+                Spacer()
+                AIProgressView()
             }
-            Button("Keep Newer") { decideAll { $0.newer ?? defaultForDeleted($0) } }
-                .help("Keeps the version changed last. If one side was deleted, the remaining file is kept. Same-time edits stay undecided.")
-            Button("Accept Deletions") { decideAll { $0.deletedSide } }
-                .disabled(!model.conflicts.contains { $0.deletedSide != nil })
-                .help("Where a file was deleted on one side and edited on the other, deletes it on the other side too. The removed file is kept as set under Deletions & Versions.")
-            Button("Keep Local") { decideAll { $0.local != nil ? "local" : nil } }
-            Button("Keep OneDrive") { decideAll { $0.onedrive != nil ? "onedrive" : nil } }
-            Button("Clear") { decisions.removeAll() }
-                .disabled(decisions.isEmpty)
+            HStack {
+                Text("For all:").foregroundStyle(.secondary)
+                Button("Keep Suggested") {
+                    decideAll { $0.analysis?.confidence == "low" ? nil : $0.analysis?.keepSide }
+                }
+                .help("Uses the suggestion wherever it is clear (high or medium confidence). Conflicts that need a merge stay undecided.")
+                if aiOn {
+                    Button { Task { if let error = await model.suggestAll() { result = "AI help failed: \(error)" } } } label: {
+                        Label("Ask AI for All", systemImage: "sparkles")
+                    }
+                    .disabled(model.aiWorking)
+                    .help("Asks the AI about every conflict where both versions exist, a few at a time. Nothing is changed. Answers are kept, and a notification tells you when it is done.")
+                    Button { decideAll { conflict in model.aiSuggestions[conflict.id].flatMap { $0.keep == "ask" ? nil : $0.keep } } } label: {
+                        Label("Use AI Suggestions", systemImage: "sparkles")
+                    }
+                    .disabled(model.aiSuggestions.isEmpty)
+                    .help("Fills in the AI's choice wherever it answered. Check them before you apply.")
+                }
+                Button("Keep Newer") { decideAll { $0.newer ?? defaultForDeleted($0) } }
+                    .help("Keeps the version changed last. If one side was deleted, the remaining file is kept. Same-time edits stay undecided.")
+                Button("Accept Deletions") { decideAll { $0.deletedSide } }
+                    .disabled(!model.conflicts.contains { $0.deletedSide != nil })
+                    .help("Where a file was deleted on one side and edited on the other, deletes it on the other side too. The removed file is kept as set under Deletions & Versions.")
+                Button("Keep Local") { decideAll { $0.local != nil ? "local" : nil } }
+                Button("Keep OneDrive") { decideAll { $0.onedrive != nil ? "onedrive" : nil } }
+                Button("Clear") { decisions.removeAll() }
+                    .disabled(decisions.isEmpty)
+            }
+            .fixedSize()
         }
         .padding(10)
     }
@@ -209,7 +215,7 @@ struct ConflictsView: View {
             HStack {
                 Text("AI help").font(.subheadline.bold())
                 Spacer()
-                if aiBusy == conflict.id || model.aiAsking == conflict.id {
+                if aiBusy == conflict.id || model.aiAsking.contains(conflict.id) {
                     ProgressView().controlSize(.small)
                     Text("AI is reading both versions…").font(.caption).foregroundStyle(.secondary)
                 }
@@ -222,7 +228,7 @@ struct ConflictsView: View {
                     Button("Ask AI") { Task { await askAI(conflict) } }
                         .disabled(aiBusy != nil || model.aiWorking || !AppModel.aiCanDecide(conflict))
                         .help(AppModel.aiCanDecide(conflict) ? "" : "Deletions and name conflicts are always yours to decide.")
-                    if conflict.analysis?.mergeable == true {
+                    if conflict.analysis?.mergeable == true, provider.writesText {
                         Button("Propose Merge…") { Task { await proposeMerge(conflict) } }
                             .disabled(aiBusy != nil)
                     }
@@ -395,7 +401,7 @@ struct MergeReviewView: View {
             }
         }
         .padding()
-        .frame(minWidth: 1000, minHeight: 520)
+        .frame(minWidth: 1100, minHeight: 520)
         .onAppear { merged = proposal.merged }
     }
 

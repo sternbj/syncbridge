@@ -223,16 +223,19 @@ actor ChatGPTAccount {
         }
     }
 
-    func complete(system: String, prompt: String, model: String) async throws -> String {
+    /// quick: little reasoning, for short yes/no style answers such as conflict decisions.
+    func complete(system: String, prompt: String, model: String, quick: Bool = false) async throws -> String {
         var chosen = model
         if chosen.isEmpty {
             guard let first = try await models().first else { throw AIError.failed("No ChatGPT model is available.") }
             chosen = first.id
         }
-        let body = try JSONSerialization.data(withJSONObject: [
+        var fields: [String: Any] = [
             "model": chosen, "instructions": system, "store": false, "stream": true,
             "input": [["role": "user", "content": prompt]],
-        ] as [String: Any])
+        ]
+        if quick { fields["reasoning"] = ["effort": "low"] }
+        var body = try JSONSerialization.data(withJSONObject: fields)
         func send(_ token: String) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
             var request = URLRequest(url: URL(string: "\(Self.api)/responses")!)
             request.httpMethod = "POST"
@@ -246,6 +249,12 @@ actor ChatGPTAccount {
         }
         var (bytes, response) = try await send(try await accessToken())
         if response.statusCode == 401 { (bytes, response) = try await send(try await accessToken(force: true)) }
+        if response.statusCode == 400, quick {
+            // A model without adjustable reasoning: ask again without it.
+            fields["reasoning"] = nil
+            body = try JSONSerialization.data(withJSONObject: fields)
+            (bytes, response) = try await send(try await accessToken())
+        }
         guard response.statusCode == 200 else {
             var data = Data()
             for try await byte in bytes.prefix(4000) { data.append(byte) }

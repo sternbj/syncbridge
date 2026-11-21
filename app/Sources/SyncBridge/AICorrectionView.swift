@@ -42,11 +42,16 @@ struct AICorrectionView: View {
                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
             HStack {
                 Button("Suggest an Instruction") { Task { await suggest() } }
-                    .disabled(feedback.trimmingCharacters(in: .whitespaces).isEmpty || working)
+                    .disabled(feedback.trimmingCharacters(in: .whitespaces).isEmpty || working
+                              || !AIAssistant.provider.writesText)
+                if !AIAssistant.provider.writesText {
+                    Text("Jev can't write text. Type the instruction yourself below.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 if working { ProgressView().controlSize(.small) }
                 if let error { Text(error).font(.caption).foregroundStyle(.red) }
             }
-            if !proposal.isEmpty || working {
+            if !proposal.isEmpty || working || !AIAssistant.provider.writesText {
                 Text("New instruction (you can edit it)").bold()
                 TextField("Instruction", text: $proposal, axis: .vertical)
                     .lineLimit(2...4)

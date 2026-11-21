@@ -6,7 +6,7 @@ import FoundationModels
 
 /// Where AI help for conflicts comes from. Cloud providers use the user's own API key.
 enum AIProvider: String, CaseIterable, Identifiable {
-    case off, chatgpt, claudeCode, apple, local, anthropic, openai, openrouter
+    case off, chatgpt, claudeCode, apple, local, jev, anthropic, openai, openrouter
 
     var id: String { rawValue }
 
@@ -20,6 +20,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .anthropic: return "Anthropic (API key)"
         case .openai: return "OpenAI (API key)"
         case .openrouter: return "OpenRouter (API key)"
+        case .jev: return "Jev by TypeSafe, fast decisions (OpenRouter API key)"
         }
     }
 
@@ -33,6 +34,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .anthropic: return "Anthropic"
         case .openai: return "OpenAI"
         case .openrouter: return "OpenRouter"
+        case .jev: return "Jev"
         case .off: return "AI"
         }
     }
@@ -43,17 +45,26 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .chatgpt, .openai: return "OpenAI"
         case .claudeCode, .anthropic: return "Anthropic"
         case .openrouter: return "OpenRouter"
+        case .jev: return "OpenRouter and TypeSafe"
         case .local: return LocalModel.serverName
         default: return "nobody"
         }
     }
 
-    var needsKey: Bool { self == .anthropic || self == .openai || self == .openrouter }
+    /// How many conflicts to ask about at once. A model on this Mac shares one processor.
+    var parallelRequests: Int { self == .local || self == .apple ? 1 : 3 }
+
+    var needsKey: Bool { self == .anthropic || self == .openai || self == .openrouter || self == .jev }
+    /// Jev only picks a version; merges and suggested instructions need a model that writes text.
+    var writesText: Bool { self != .jev }
+    /// Whose key is used: Jev runs on the OpenRouter key.
+    var keyAccount: String { self == .jev ? AIProvider.openrouter.rawValue : rawValue }
     var isCloud: Bool { self != .off && self != .apple }
 
     var defaultModel: String {
         switch self {
         case .anthropic: return "claude-sonnet-5-5"
+        case .jev: return Jev.latestModel
         default: return ""
         }
     }
@@ -63,6 +74,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .anthropic: return "e.g. claude-sonnet-5-5"
         case .openai: return "model name from your OpenAI account"
         case .openrouter: return "e.g. anthropic/… or openai/… (see openrouter.ai/models)"
+        case .jev: return Jev.latestModel + " (always the newest version)"
         default: return ""
         }
     }
@@ -71,7 +83,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         switch self {
         case .anthropic: return "https://console.anthropic.com/settings/keys"
         case .openai: return "https://platform.openai.com/api-keys"
-        case .openrouter: return "https://openrouter.ai/keys"
+        case .openrouter, .jev: return "https://openrouter.ai/keys"
         default: return ""
         }
     }
@@ -118,11 +130,11 @@ enum KeychainStore {
     }
 
     static func key(for provider: AIProvider) -> String? {
-        read(provider.rawValue).flatMap { String(data: $0, encoding: .utf8) }
+        read(provider.keyAccount).flatMap { String(data: $0, encoding: .utf8) }
     }
 
     static func setKey(_ key: String, for provider: AIProvider) {
-        write(Data(key.trimmingCharacters(in: .whitespacesAndNewlines).utf8), account: provider.rawValue)
+        write(Data(key.trimmingCharacters(in: .whitespacesAndNewlines).utf8), account: provider.keyAccount)
     }
 }
 
@@ -172,18 +184,26 @@ struct AIAssistant {
         self.provider = provider
     }
 
-    func complete(system: String, prompt: String) async throws -> String {
+    /// quick: the answer needs little thinking (a conflict decision); faster where the provider allows it.
+    func complete(system: String, prompt: String, quick: Bool = false) async throws -> String {
         switch provider {
         case .off:
             throw AIError.notConfigured("AI help is off. Choose a provider in Settings › AI.")
         case .chatgpt:
-            return try await ChatGPTAccount.shared.complete(system: system, prompt: prompt, model: Self.model(for: provider))
+            return try await ChatGPTAccount.shared.complete(
+                system: system, prompt: prompt, model: Self.model(for: provider), quick: quick
+            )
         case .claudeCode:
             return try await ClaudeCode.complete(system: system, prompt: prompt, model: Self.model(for: provider))
         case .apple:
             return try await completeWithApple(system: system, prompt: prompt)
         case .anthropic, .openai, .openrouter, .local:
             return try await completeInCloud(system: system, prompt: prompt)
+        case .jev:
+            throw AIError.notConfigured(
+                "Jev only picks which version to keep; it can't write text. For merges and suggested "
+                    + "instructions, choose another AI in Settings › AI."
+            )
         }
     }
 
@@ -307,7 +327,14 @@ struct AIAssistant {
         you are not sure. Never invent content. Answer in English.\(userInstructions)
         """
         let prompt = "Laptop saved: \(when(local)). OneDrive saved: \(when(onedrive)).\n\n" + versions(texts)
-        return Self.parseDecision(try await complete(system: system, prompt: prompt))
+        if provider == .jev {
+            guard let key = KeychainStore.key(for: provider) else {
+                throw AIError.notConfigured("Add your OpenRouter API key in Settings › AI.")
+            }
+            let instructions = AITrust.currentInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+            return try await Jev.decide(state: prompt, instructions: instructions, model: Self.model(for: provider), key: key)
+        }
+        return Self.parseDecision(try await complete(system: system, prompt: prompt, quick: true))
     }
 
     static func parseDecision(_ answer: String) -> AIDecision {

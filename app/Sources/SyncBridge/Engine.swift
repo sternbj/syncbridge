@@ -24,7 +24,7 @@ struct EngineStatus: Decodable {
     let syncIntervalMinutes: Int
 }
 
-struct FileVersion: Decodable, Hashable {
+struct FileVersion: Codable, Hashable {
     let modified: Int
     let size: Int
 
