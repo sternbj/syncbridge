@@ -44,3 +44,6 @@ jobs:
       - name: Build the menu bar app
         working-directory: app
         run: swift build
+      - name: Run app tests
+        working-directory: app
+        run: swift test

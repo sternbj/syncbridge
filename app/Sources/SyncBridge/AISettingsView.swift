@@ -7,7 +7,7 @@ struct AISettingsView: View {
     @State private var model = ""
     @State private var key = ""
     @State private var hasKey = false
-    @State private var testResult: String?
+    @State private var testResult: TestOutcome?
     @State private var testing = false
     @State private var chatgptEmail: String?
     @State private var chatgptModels: [ChatGPTModel] = []
@@ -19,6 +19,10 @@ struct AISettingsView: View {
     @AppStorage(LocalModel.addressKey) private var localAddress = LocalModel.defaultAddress
     @State private var localModels: [String] = []
     @State private var localStatus: String?
+    @AppStorage(Jev.enabledKey) private var jevOn = false
+    @State private var catalog: [CatalogModel] = []
+    @State private var upgrade: ModelUpgrade?
+    @State private var checkingModels = false
 
     private var provider: AIProvider { AIProvider(rawValue: providerRaw) ?? .off }
 
@@ -47,17 +51,22 @@ struct AISettingsView: View {
             if provider == .local { localSection }
             if provider.needsKey {
                 Section(provider.label) {
-                    TextField("Model", text: $model, prompt: Text(provider.modelHint))
-                        .onSubmit(saveModel)
+                    HStack {
+                        TextField("Model", text: $model, prompt: Text(provider.modelHint))
+                            .onSubmit(saveModel)
+                        ModelMenu(models: catalog) { model = $0; saveModel() }
+                    }
+                    if let upgrade { upgradeNotice(upgrade) }
+                    modelListStatus
                     SecureField(hasKey ? "API key (saved — enter a new one to replace it)" : "API key", text: $key)
-                        .onSubmit(saveKey)
+                        .onSubmit { saveKey() }
                     HStack {
                         Link("Get an API key", destination: URL(string: provider.keyURL)!)
                         Spacer()
                         if hasKey { Button("Remove Key") { KeychainStore.setKey("", for: provider); refresh() } }
                         Button("Save") { saveModel(); saveKey() }
                     }
-                    Text(provider == .jev ? Self.jevNote : """
+                    Text("""
                     Uses your own API key and is billed by \(provider.name). The key is stored in the macOS \
                     Keychain. When you ask for help, the text of both versions of that one file is sent to \
                     \(provider.name). For a ChatGPT or Claude subscription, choose the subscription entry instead.
@@ -71,8 +80,11 @@ struct AISettingsView: View {
                         Button("Test Connection") { Task { await test() } }.disabled(testing)
                         if testing { ProgressView().controlSize(.small) }
                     }
-                    if let testResult { Text(testResult).font(.caption).textSelection(.enabled) }
+                    if let testResult { TestOutcomeView(outcome: testResult) }
                 }
+            }
+            JevSettingsSection(provider: provider)
+            if provider != .off || jevOn {
                 AIInstructionsView(provider: provider)
             }
         }
@@ -118,7 +130,7 @@ struct AISettingsView: View {
             }
             if let localStatus { Text(localStatus).font(.caption).foregroundStyle(.secondary) }
             SecureField(hasKey ? "API key (saved)" : "API key (only if your server needs one)", text: $key)
-                .onSubmit(saveKey)
+                .onSubmit { saveKey() }
             Text("""
             Runs on your own computer: file text stays on this Mac (or your network). Install Ollama \
             from ollama.com and download a model in Terminal, e.g. `ollama pull llama3.2`, or start the \
@@ -290,7 +302,7 @@ struct AISettingsView: View {
             _ = try await ChatGPTAccount.shared.signIn()
             testResult = nil
         } catch {
-            testResult = signInCancelled ? nil : "Sign-in failed: \(error.localizedDescription)"
+            testResult = signInCancelled ? nil : .failure("Sign-in failed: \(error.localizedDescription)")
         }
         refresh(keepResult: true)
     }
@@ -299,6 +311,8 @@ struct AISettingsView: View {
 
     private func refresh(keepResult: Bool) {
         model = AIAssistant.model(for: provider)
+        catalog = ModelCatalog.models(for: provider)
+        upgrade = ModelCatalog.upgrade(for: provider)
         key = ""
         hasKey = KeychainStore.key(for: provider) != nil
         if !keepResult { testResult = nil }
@@ -311,47 +325,209 @@ struct AISettingsView: View {
         }
     }
 
-    static let jevNote = """
-    Jev answers in about a second and costs a fraction of a cent per file. It only picks a version \
-    and says how sure it is, without reasons; below \(Int(Jev.minimumProbability * 100))% it leaves the \
-    file to you. It can't merge or suggest instructions. It uses your OpenRouter key (shared with the \
-    OpenRouter entry), stored in the macOS Keychain, and the text of both versions is sent to \
-    OpenRouter and TypeSafe in the US.
-    """
-
     private func saveModel() {
         UserDefaults.standard.set(model.trimmingCharacters(in: .whitespaces), forKey: AIAssistant.modelKeyPrefix + provider.rawValue)
+        upgrade = ModelCatalog.upgrade(for: provider)
     }
 
-    private func saveKey() {
-        guard !key.isEmpty else { return }
-        KeychainStore.setKey(key, for: provider)
+    private func upgradeNotice(_ upgrade: ModelUpgrade) -> some View {
+        HStack {
+            Label("Newer version available: \(upgrade.newer) (you use \(upgrade.current))", systemImage: "sparkles")
+                .font(.caption)
+            Spacer()
+            Button("Switch") {
+                ModelCatalog.accept(upgrade)
+                refresh(keepResult: true)
+            }
+        }
+    }
+
+    private var modelListStatus: some View {
+        HStack {
+            Group {
+                if catalog.isEmpty {
+                    Text(hasKey || provider == .openrouter
+                         ? "The list of current models loads in the background."
+                         : "Save your API key to load the list of current models.")
+                } else if let checked = ModelCatalog.lastCheck {
+                    Text("\(catalog.count) current models (newest version of each, from the last 12 months). "
+                         + "Checked \(checked.formatted(.relative(presentation: .named))); checked again weekly.")
+                }
+            }
+            .font(.caption).foregroundStyle(.secondary)
+            Spacer()
+            if checkingModels { ProgressView().controlSize(.small) }
+            Button("Check Now") {
+                Task {
+                    checkingModels = true
+                    await ModelCatalog.refresh(force: true)
+                    checkingModels = false
+                    refresh(keepResult: true)
+                }
+            }
+            .disabled(checkingModels)
+        }
+    }
+
+    /// False when the typed key can't work; the reason is shown below the buttons.
+    @discardableResult
+    private func saveKey() -> Bool {
+        guard !key.isEmpty else { return true }
+        if let problem = KeychainStore.setCheckedKey(key, for: provider) {
+            testResult = .failure(problem)
+            return false
+        }
         key = ""
         hasKey = KeychainStore.key(for: provider) != nil
+        testResult = nil
+        return true
     }
 
     private func test() async {
         saveModel()
-        saveKey()
+        guard saveKey() else { return }
         testing = true
         defer { testing = false }
         do {
-            if provider == .jev {
-                let start = Date()
-                let decision = try await Jev.decide(
-                    state: "=== LAPTOP VERSION ===\nMeeting at 10.\n=== ONEDRIVE VERSION ===\nMeeting at 10. Bring the report.",
-                    instructions: "", model: AIAssistant.model(for: provider), key: KeychainStore.key(for: provider) ?? ""
-                )
-                let seconds = Date().timeIntervalSince(start).formatted(.number.precision(.fractionLength(1)))
-                testResult = "Connected in \(seconds) s. Test answer: \(decision.reason)"
-                return
-            }
             let answer = try await AIAssistant(provider: provider).complete(
                 system: "Reply with exactly: OK", prompt: "Connection test"
             )
-            testResult = "Connected. The model answered: \(answer.prefix(80))"
+            testResult = .ok("Connected. The model answered: \(answer.prefix(80))")
         } catch {
-            testResult = "Failed: \(error.localizedDescription)"
+            testResult = .failure(error.localizedDescription)
         }
+    }
+}
+
+/// Jev decides which version to keep, quickly, on the OpenRouter key; the provider above
+/// keeps doing everything that writes text (reasons on request, merges, instructions).
+struct JevSettingsSection: View {
+    let provider: AIProvider
+    @AppStorage(Jev.enabledKey) private var jevOn = false
+    @AppStorage(Jev.modelKey) private var model = ""
+    @State private var key = ""
+    @State private var hasKey = KeychainStore.key(for: .openrouter) != nil
+    @State private var result: TestOutcome?
+    @State private var testing = false
+
+    var body: some View {
+        Section {
+            Toggle("Let Jev decide which version to keep", isOn: $jevOn)
+                .onChange(of: jevOn) { _ in AITrust.shared.autoDecide = false }
+            if jevOn {
+                TextField("Model", text: $model, prompt: Text(Jev.latestModel + " (always the newest version)"))
+                SecureField(hasKey ? "OpenRouter API key (saved — enter a new one to replace it)" : "OpenRouter API key",
+                            text: $key)
+                    .onSubmit { saveKey() }
+                HStack {
+                    Link("Get an OpenRouter key", destination: URL(string: AIProvider.openrouter.keyURL)!)
+                    Spacer()
+                    if testing { ProgressView().controlSize(.small) }
+                    Button("Test Jev") { Task { await test() } }.disabled(testing)
+                    Button("Save Key") { saveKey() }.disabled(key.isEmpty)
+                }
+                if let result { TestOutcomeView(outcome: result) }
+            }
+        } header: {
+            Text("Fast decisions with Jev")
+        } footer: {
+            Text(note).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var note: String {
+        let writer = provider == .off
+            ? "Choose an AI provider above for written explanations, merges and suggested instructions; Jev writes no text."
+            : "\(provider.name) above still explains decisions on request (\"Why?\"), proposes merges and suggests instructions."
+        return """
+        Jev by TypeSafe picks a version in about a second for a fraction of a cent per file, says \
+        how sure it is and names short reasons from a fixed list; below \(Int(Jev.minimumProbability * 100))% it leaves the file to you. \(writer) \
+        It uses your OpenRouter key (the same as for the OpenRouter provider), stored in the macOS \
+        Keychain. The text of both versions goes to OpenRouter and TypeSafe in the US. Switching Jev \
+        on or off starts the agreement count for automatic decisions again.
+        """
+    }
+
+    /// False when the typed key can't work; the reason is shown below the buttons.
+    @discardableResult
+    private func saveKey() -> Bool {
+        guard !key.isEmpty else { return true }
+        if let problem = KeychainStore.setCheckedKey(key, for: .openrouter) {
+            result = .failure(problem)
+            return false
+        }
+        key = ""
+        hasKey = KeychainStore.key(for: .openrouter) != nil
+        result = nil
+        return true
+    }
+
+    private func test() async {
+        guard saveKey() else { return }
+        testing = true
+        defer { testing = false }
+        let start = Date()
+        do {
+            let decision = try await Jev.decide(
+                state: "=== LAPTOP VERSION ===\nMeeting at 10.\n=== ONEDRIVE VERSION ===\nMeeting at 10. Bring the report.",
+                instructions: ""
+            )
+            let seconds = Date().timeIntervalSince(start).formatted(.number.precision(.fractionLength(1)))
+            result = .ok("Connected in \(seconds) s. Test answer: \(decision.reason)")
+        } catch {
+            result = .failure(error.localizedDescription)
+        }
+    }
+}
+
+/// The outcome of a connection test or key check; failures are marked so they aren't missed.
+struct TestOutcome: Equatable {
+    let text: String
+    let failed: Bool
+
+    static func ok(_ text: String) -> Self { Self(text: text, failed: false) }
+    static func failure(_ text: String) -> Self { Self(text: text, failed: true) }
+}
+
+struct TestOutcomeView: View {
+    let outcome: TestOutcome
+
+    var body: some View {
+        Label {
+            Text(outcome.text).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: outcome.failed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                .foregroundStyle(outcome.failed ? Color.red : Color.green)
+        }
+        .font(.caption)
+    }
+}
+
+/// Picks a model from the weekly list: "always newest" names first, then grouped by maker.
+struct ModelMenu: View {
+    let models: [CatalogModel]
+    let choose: (String) -> Void
+
+    var body: some View {
+        Menu("Choose") {
+            let automatic = models.filter(\.isAlwaysNewest)
+            if !automatic.isEmpty {
+                Section("Always the newest version") { buttons(automatic) }
+            }
+            let byMaker = Dictionary(grouping: models.filter { !$0.isAlwaysNewest }, by: \.maker)
+            if byMaker.keys.count == 1, let only = byMaker.values.first {
+                buttons(only)
+            } else {
+                ForEach(byMaker.keys.sorted(), id: \.self) { maker in
+                    Menu(maker) { buttons(byMaker[maker] ?? []) }
+                }
+            }
+        }
+        .fixedSize()
+        .disabled(models.isEmpty)
+    }
+
+    private func buttons(_ list: [CatalogModel]) -> some View {
+        ForEach(list, id: \.id) { model in Button(model.id) { choose(model.id) } }
     }
 }

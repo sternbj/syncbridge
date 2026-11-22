@@ -34,6 +34,7 @@ final class AppModel: ObservableObject {
     let engine = Engine()
     private var scheduleTimer: Timer?
     private var statusTimer: Timer?
+    private var modelCheckTimer: Timer?
     private var watcher: FolderWatcher?
     private var watchedPairs: [PairInfo] = []
     private var changedPairs: Set<String> = []
@@ -44,6 +45,7 @@ final class AppModel: ObservableObject {
     private let notificationDelegate = NotificationDelegate()
 
     init() {
+        AIAssistant.migrate()
         UNUserNotificationCenter.current().delegate = notificationDelegate
         WindowActivation.shared.start()
         AppDelegate.onReopen = { [weak self] in self?.show("settings") }
@@ -67,6 +69,22 @@ final class AppModel: ObservableObject {
         }
         statusTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { await self?.refreshStatus() }
+        }
+        // The model lists are downloaded once a week; looking every few hours catches a Mac that slept.
+        Task { await checkModels() }
+        modelCheckTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            Task { await self?.checkModels() }
+        }
+    }
+
+    /// Tells the user when a newer version of the model they use is out; switching is their choice.
+    private func checkModels() async {
+        for upgrade in await ModelCatalog.refresh() where upgrade.provider == AIAssistant.provider {
+            post(EngineNotification(
+                title: "Newer AI model available",
+                message: "\(upgrade.newer) is out (you use \(upgrade.current)). Switch in Settings › AI.",
+                open: "ai"
+            ))
         }
     }
 
@@ -267,7 +285,8 @@ final class AppModel: ObservableObject {
     }
 
     func loadConflictTexts(_ conflict: Conflict) async throws -> ConflictTexts {
-        let limit = String(AIAssistant.provider.maxCharsPerVersion)
+        // Long enough for whoever reads it; each prompt shortens to its own model's size.
+        let limit = String(max(AIAssistant.decisionMaxChars, AIAssistant.provider.maxCharsPerVersion))
         return try await engine.decode(
             ConflictTexts.self, ["--conflict-texts", conflict.pair, conflict.file, "--max-chars", limit]
         )
@@ -297,10 +316,17 @@ final class AppModel: ObservableObject {
         aiSuggestions[conflict.id] = decision
         savedSuggestions[conflict.id] = SavedSuggestion(
             decision: decision, local: conflict.local, onedrive: conflict.onedrive,
-            instructions: AITrust.fingerprint(AITrust.currentInstructions)
+            instructions: AITrust.currentFingerprint
         )
         AITrust.save(savedSuggestions, to: AITrust.supportFile("ai-suggestions.json"))
         return decision
+    }
+
+    /// The AI provider's own view of a conflict, with reasons, e.g. to explain what Jev decided.
+    /// Not saved and not counted: Jev's suggestion stays the one that is measured.
+    func explain(_ conflict: Conflict) async throws -> AIDecision {
+        let texts = try await loadConflictTexts(conflict)
+        return try await AIAssistant().decide(texts, local: conflict.local, onedrive: conflict.onedrive, useJev: false)
     }
 
     /// Asks the AI about every open conflict it may decide, a few at a time, skipping those it
@@ -315,7 +341,7 @@ final class AppModel: ObservableObject {
         defer { aiProgress = nil }
         aiQueue = Array(queue)
         aiFailure = nil
-        let workers = (0..<AIAssistant.provider.parallelRequests).map { _ in Task { await aiWorker() } }
+        let workers = (0..<AIAssistant.decisionParallelRequests).map { _ in Task { await aiWorker() } }
         for worker in workers { await worker.value }
         let failure = aiFailure
         if notify, let failure, Date().timeIntervalSince(started) > 20 {
@@ -347,7 +373,7 @@ final class AppModel: ObservableObject {
     /// After a sync, with automatic decisions on: the AI resolves the conflicts it is sure about.
     private func decideAutomatically() async {
         let trust = AITrust.shared
-        guard trust.autoDecide, trust.isEligible, AIAssistant.provider != .off, !conflicts.isEmpty else { return }
+        guard trust.autoDecide, trust.isEligible, AIAssistant.canDecide, !conflicts.isEmpty else { return }
         _ = await suggestAll(notify: false)
         let batch = conflicts.filter(Self.aiCanDecide).compactMap { conflict -> ConflictDecision? in
             guard let keep = aiSuggestions[conflict.id]?.keep, keep != "ask" else { return nil }
@@ -427,6 +453,11 @@ final class AppModel: ObservableObject {
 
     /// Shows an app window ("conflicts", "deletions", "preview", "settings") or the last summary.
     func show(_ target: String) {
+        if target == "ai" {
+            settingsTab = "ai"
+            show("settings")
+            return
+        }
         if target == "summary" {
             open(status?.summaryFile)
             return

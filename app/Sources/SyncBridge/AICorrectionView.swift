@@ -43,15 +43,15 @@ struct AICorrectionView: View {
             HStack {
                 Button("Suggest an Instruction") { Task { await suggest() } }
                     .disabled(feedback.trimmingCharacters(in: .whitespaces).isEmpty || working
-                              || !AIAssistant.provider.writesText)
-                if !AIAssistant.provider.writesText {
-                    Text("Jev can't write text. Type the instruction yourself below.")
+                              || AIAssistant.provider == .off)
+                if AIAssistant.provider == .off {
+                    Text("Suggestions need an AI provider in Settings › AI. Type the instruction yourself below.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if working { ProgressView().controlSize(.small) }
                 if let error { Text(error).font(.caption).foregroundStyle(.red) }
             }
-            if !proposal.isEmpty || working || !AIAssistant.provider.writesText {
+            if !proposal.isEmpty || working || AIAssistant.provider == .off {
                 Text("New instruction (you can edit it)").bold()
                 TextField("Instruction", text: $proposal, axis: .vertical)
                     .lineLimit(2...4)
