@@ -81,9 +81,10 @@ final class AITrust: ObservableObject {
         UserDefaults.standard.string(forKey: instructionsKey) ?? ""
     }
 
-    /// The instructions plus who decides: switching to or from Jev starts the count again.
+    /// The instructions plus who decides (Jev or the provider, with its model): switching either
+    /// starts the count again, and saved answers from another decider no longer fit.
     nonisolated static var currentFingerprint: String {
-        fingerprint(currentInstructions + (Jev.isOn ? "\n#decider:jev" : ""))
+        fingerprint(currentInstructions + "\n#decider:" + AIAssistant.deciderID)
     }
 
     nonisolated static func fingerprint(_ text: String) -> String {

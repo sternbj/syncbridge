@@ -105,7 +105,7 @@ import Testing
         #expect(models.map(\.id) == ["claude-sonnet-5-5", "claude-opus-4-1-20250805"])
         #expect(models.first?.created == ISO8601DateFormatter().date(from: "2026-09-29T00:00:00Z"))
         // Both dated and undated names land in one family, so the newer one replaces the older.
-        #expect(ModelCatalog.replacement(for: "claude-opus-4-1-20250805",
+        #expect(ModelCatalog.replacement(for: "claude-opus-4-1-20250805", released: models.last?.created,
                                          in: [Self.model("claude-opus-5-5", daysAgo: 60)]) == "claude-opus-5-5")
     }
 
@@ -138,10 +138,27 @@ import Testing
 
     @Test func replacesOutdatedModelWithNewestOfItsFamily() {
         let list = [Self.model("moonshotai/kimi-k3", daysAgo: 120), Self.model("anthropic/claude-opus-5.5", daysAgo: 60)]
-        #expect(ModelCatalog.replacement(for: "moonshotai/kimi-k2.5", in: list) == "moonshotai/kimi-k3")
-        #expect(ModelCatalog.replacement(for: "moonshotai/kimi-k3", in: list) == nil) // already the newest
-        #expect(ModelCatalog.replacement(for: "my-own-finetune", in: list) == nil)    // unknown: left alone
-        #expect(ModelCatalog.replacement(for: "~moonshotai/kimi-latest", in: list) == nil) // updates itself
+        let k25 = Self.now.addingTimeInterval(-300 * Self.day)
+        #expect(ModelCatalog.replacement(for: "moonshotai/kimi-k2.5", released: k25, in: list) == "moonshotai/kimi-k3")
+        #expect(ModelCatalog.replacement(for: "moonshotai/kimi-k3", released: list[0].created, in: list) == nil)
+        #expect(ModelCatalog.replacement(for: "my-own-finetune", released: k25, in: list) == nil)
+        #expect(ModelCatalog.replacement(for: "~moonshotai/kimi-latest", released: k25, in: list) == nil)
+    }
+
+    @Test func neverOffersAnOlderModel() {
+        let list = [Self.model("moonshotai/kimi-k3", daysAgo: 120)]
+        // Set by hand to a newer model the short list doesn't show (e.g. a preview): no "upgrade" to K3.
+        let preview = Self.now.addingTimeInterval(-10 * Self.day)
+        #expect(ModelCatalog.replacement(for: "moonshotai/kimi-k3.2-preview", released: preview, in: list) == nil)
+        // Not in the provider's list at all, so its age is unknown: left alone.
+        #expect(ModelCatalog.replacement(for: "moonshotai/kimi-k3.2-preview", released: nil, in: list) == nil)
+    }
+
+    @Test func remembersReleaseDatesOfAllListedModels() {
+        let models = [Self.model("moonshotai/kimi-k2.5", daysAgo: 300), Self.model("moonshotai/kimi-k3", daysAgo: 120)]
+        let dates = ModelCatalog.releaseDates(models)
+        #expect(dates["moonshotai/kimi-k2.5"] == models[0].created)
+        #expect(dates["moonshotai/kimi-k3"] == models[1].created)
     }
 
     // MARK: Once a week

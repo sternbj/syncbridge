@@ -79,7 +79,9 @@ final class AppModel: ObservableObject {
 
     /// Tells the user when a newer version of the model they use is out; switching is their choice.
     private func checkModels() async {
-        for upgrade in await ModelCatalog.refresh() where upgrade.provider == AIAssistant.provider {
+        for upgrade in await ModelCatalog.refresh()
+        where upgrade.provider == AIAssistant.provider && ModelCatalog.isNew(upgrade) {
+            ModelCatalog.markNotified(upgrade)
             post(EngineNotification(
                 title: "Newer AI model available",
                 message: "\(upgrade.newer) is out (you use \(upgrade.current)). Switch in Settings › AI.",
@@ -311,12 +313,16 @@ final class AppModel: ObservableObject {
     func suggest(_ conflict: Conflict) async throws -> AIDecision {
         aiAsking.insert(conflict.id)
         defer { aiAsking.remove(conflict.id) }
+        // The answer belongs to the settings it was asked with; if they change meanwhile, it is dropped.
+        let fingerprint = AITrust.currentFingerprint
         let texts = try await loadConflictTexts(conflict)
         let decision = try await AIAssistant().decide(texts, local: conflict.local, onedrive: conflict.onedrive)
+        guard AITrust.currentFingerprint == fingerprint else {
+            throw AIError.failed("The AI settings or instructions changed while waiting for the answer. Ask again.")
+        }
         aiSuggestions[conflict.id] = decision
         savedSuggestions[conflict.id] = SavedSuggestion(
-            decision: decision, local: conflict.local, onedrive: conflict.onedrive,
-            instructions: AITrust.currentFingerprint
+            decision: decision, local: conflict.local, onedrive: conflict.onedrive, instructions: fingerprint
         )
         AITrust.save(savedSuggestions, to: AITrust.supportFile("ai-suggestions.json"))
         return decision

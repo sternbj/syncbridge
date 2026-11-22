@@ -30,9 +30,10 @@ enum ModelCatalog {
     static let maxAge: TimeInterval = 365 * 86_400
     static let minContext = 32_000
     static let providers: [AIProvider] = [.openrouter, .anthropic, .openai]
-    private static let lastCheckKey = "modelCatalog.lastCheck"
+    private static func lastCheckKey(_ provider: AIProvider) -> String { "modelCatalog.lastCheck.\(provider.rawValue)" }
     private static func listKey(_ provider: AIProvider) -> String { "modelCatalog.\(provider.rawValue)" }
     private static func notifiedKey(_ provider: AIProvider) -> String { "modelCatalog.notified.\(provider.rawValue)" }
+    private static func datesKey(_ provider: AIProvider) -> String { "modelCatalog.dates.\(provider.rawValue)" }
 
     // MARK: Rules
 
@@ -84,15 +85,21 @@ enum ModelCatalog {
         return newest.values.sorted { $0.id < $1.id }
     }
 
-    /// The newer model of the same family, if the list has one. Unknown names and
-    /// "always newest" names are left alone.
-    static func replacement(for id: String, in list: [CatalogModel]) -> String? {
+    /// The newer model of the same family, if the list has one released after the current model.
+    /// Models with an unknown release date (not in the provider's list) and "always newest"
+    /// names are left alone, so an older model is never offered as an upgrade.
+    static func replacement(for id: String, released: Date?, in list: [CatalogModel]) -> String? {
         let current = CatalogModel(id: id, created: .distantPast, context: 0)
-        guard !id.isEmpty, !current.isAlwaysNewest else { return nil }
+        guard !id.isEmpty, !current.isAlwaysNewest, let released else { return nil }
         let key = family(of: id)
         guard let newest = list.filter({ !$0.isAlwaysNewest && family(of: $0.id) == key })
-            .max(by: { $0.created < $1.created }), newest.id != id else { return nil }
+            .max(by: { $0.created < $1.created }), newest.id != id, newest.created > released else { return nil }
         return newest.id
+    }
+
+    /// Release dates of every model the provider lists, also old ones, to compare the current model.
+    static func releaseDates(_ models: [CatalogModel]) -> [String: Date] {
+        Dictionary(models.map { ($0.id, $0.created) }, uniquingKeysWith: max)
     }
 
     static func isDue(lastCheck: Date?, now: Date) -> Bool {
@@ -142,7 +149,10 @@ enum ModelCatalog {
 
     // MARK: Weekly check
 
-    static var lastCheck: Date? { UserDefaults.standard.object(forKey: lastCheckKey) as? Date }
+    /// When the provider's list was last downloaded successfully.
+    static func lastCheck(for provider: AIProvider) -> Date? {
+        UserDefaults.standard.object(forKey: lastCheckKey(provider)) as? Date
+    }
 
     /// The saved list for a provider; empty before the first check.
     static func models(for provider: AIProvider) -> [CatalogModel] {
@@ -153,30 +163,32 @@ enum ModelCatalog {
     /// A newer version of the model the provider is set to.
     static func upgrade(for provider: AIProvider) -> ModelUpgrade? {
         let current = AIAssistant.model(for: provider)
-        return replacement(for: current, in: models(for: provider))
+        let dates = UserDefaults.standard.dictionary(forKey: datesKey(provider)) as? [String: Date] ?? [:]
+        return replacement(for: current, released: dates[current], in: models(for: provider))
             .map { ModelUpgrade(provider: provider, current: current, newer: $0) }
     }
 
-    /// Downloads the lists when a week has passed (or always, with force). Returns upgrades
-    /// the user hasn't been told about yet.
+    /// Downloads each provider's list when its week has passed (or always, with force) and
+    /// returns the upgrades available now. A failed download is tried again at the next check.
     @discardableResult
     static func refresh(force: Bool = false, now: Date = Date()) async -> [ModelUpgrade] {
-        guard force || isDue(lastCheck: lastCheck, now: now) else { return [] }
-        var anyLoaded = false
-        for provider in providers {
+        for provider in providers where force || isDue(lastCheck: lastCheck(for: provider), now: now) {
             guard let list = await download(provider), !list.isEmpty else { continue }
             let kept = newestPerFamily(list, now: now)
             UserDefaults.standard.set(try? JSONEncoder().encode(kept), forKey: listKey(provider))
-            anyLoaded = true
+            UserDefaults.standard.set(releaseDates(list), forKey: datesKey(provider))
+            UserDefaults.standard.set(now, forKey: lastCheckKey(provider))
         }
-        // Without a connection, try again at the next check instead of waiting a week.
-        if anyLoaded { UserDefaults.standard.set(now, forKey: lastCheckKey) }
-        return providers.compactMap(upgrade).filter { upgrade in
-            let key = notifiedKey(upgrade.provider)
-            guard UserDefaults.standard.string(forKey: key) != upgrade.newer else { return false }
-            UserDefaults.standard.set(upgrade.newer, forKey: key)
-            return true
-        }
+        return providers.compactMap(upgrade)
+    }
+
+    /// Whether the user hasn't been told about this upgrade yet.
+    static func isNew(_ upgrade: ModelUpgrade) -> Bool {
+        UserDefaults.standard.string(forKey: notifiedKey(upgrade.provider)) != upgrade.newer
+    }
+
+    static func markNotified(_ upgrade: ModelUpgrade) {
+        UserDefaults.standard.set(upgrade.newer, forKey: notifiedKey(upgrade.provider))
     }
 
     /// Switches the provider to the newer model the user accepted.

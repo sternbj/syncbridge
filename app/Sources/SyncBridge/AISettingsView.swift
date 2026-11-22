@@ -349,7 +349,7 @@ struct AISettingsView: View {
                     Text(hasKey || provider == .openrouter
                          ? "The list of current models loads in the background."
                          : "Save your API key to load the list of current models.")
-                } else if let checked = ModelCatalog.lastCheck {
+                } else if let checked = ModelCatalog.lastCheck(for: provider) {
                     Text("\(catalog.count) current models (newest version of each, from the last 12 months). "
                          + "Checked \(checked.formatted(.relative(presentation: .named))); checked again weekly.")
                 }

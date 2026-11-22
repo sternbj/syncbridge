@@ -21,8 +21,10 @@ enum APICall {
                let key = request.value(forHTTPHeaderField: "Authorization")?.replacingOccurrences(of: "Bearer ", with: "") {
                 keyWorks = await openRouterKeyWorks(key)
             }
+            let secrets = [request.value(forHTTPHeaderField: "Authorization")?.replacingOccurrences(of: "Bearer ", with: ""),
+                           request.value(forHTTPHeaderField: "x-api-key")].compactMap { $0 }
             throw AIError.failed(explain(status: status, data: data, provider: provider, feature: feature,
-                                         model: model(of: request), keyWorks: keyWorks))
+                                         model: model(of: request), keyWorks: keyWorks, secrets: secrets))
         }
         return json
     }
@@ -30,7 +32,7 @@ enum APICall {
     // MARK: Explanations
 
     static func explain(status: Int, data: Data, provider: AIProvider, feature: String? = nil,
-                        model: String? = nil, keyWorks: Bool? = nil) -> String {
+                        model: String? = nil, keyWorks: Bool? = nil, secrets: [String] = []) -> String {
         let name = provider.name
         let what = feature ?? name
         let keys = provider.keyURL.isEmpty ? "" : " (\(display(provider.keyURL)))"
@@ -52,15 +54,20 @@ enum APICall {
         case 402:
             text = "Your \(name) balance is used up (error 402). Add credits at \(display(provider.billingURL)), then test again."
         case 403:
-            text = "\(name) refused the request (error 403). The key works but isn't allowed to do this: "
-                + "it may have hit its spending limit, or your account has no access to \(modelName)."
-            if !provider.keyURL.isEmpty { text += " Check the key's limits at \(display(provider.keyURL))." }
+            text = "\(name) refused the request (error 403). Common causes: the key reached its spending limit, "
+                + "or your account has no access to \(modelName)."
+            if !provider.keyURL.isEmpty { text += " Check the key and its limits at \(display(provider.keyURL))." }
+        case 404 where provider == .local:
+            text = "The server answered “not found” (error 404). Check the server address (it usually ends in /v1) "
+                + "and that \(modelName) is loaded on the server."
         case 404:
             text = "\(name) doesn't know \(modelName) (error 404). Check the spelling of the model name in Settings › AI."
         case 408, 504:
             text = "\(name) took too long to answer (error \(status)). Try again in a moment."
         case 413:
             text = "The file is too large for \(name) (error 413). Try a model with a bigger context."
+        case 429 where provider == .local:
+            text = "The server is busy (error 429). Wait until it has finished other requests, then try again."
         case 429:
             text = "Too many requests or quota used up at \(name) (error 429). Wait a minute and try again; "
                 + "if it keeps happening, check your plan and billing at \(display(provider.billingURL))."
@@ -69,7 +76,7 @@ enum APICall {
         default:
             text = "\(name) answered with error \(status)."
         }
-        if let detail = serviceMessage(data) { text += "\n\(name) said: \(detail)" }
+        if let detail = serviceMessage(data).map({ redact($0, secrets: secrets) }) { text += "\n\(name) said: \(detail)" }
         return text
     }
 
@@ -115,8 +122,15 @@ enum APICall {
         let error = json?["error"]
         let message = (error as? [String: Any])?["message"] as? String ?? error as? String ?? json?["message"] as? String
             ?? String(data: data, encoding: .utf8).map { String($0.prefix(300)) }
-        let trimmed = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmed = String((message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").prefix(300))
         return trimmed.isEmpty || trimmed.hasPrefix("<") ? nil : trimmed
+    }
+
+    /// Error text is shown in Settings and notifications: never with the key in it, even if a service echoes it.
+    static func redact(_ text: String, secrets: [String]) -> String {
+        var text = secrets.filter { $0.count >= 8 }.reduce(text) { $0.replacingOccurrences(of: $1, with: "[key]") }
+        text = text.replacingOccurrences(of: #"sk-[A-Za-z0-9_\-]{8,}"#, with: "[key]", options: .regularExpression)
+        return text
     }
 
     private static func model(of request: URLRequest) -> String? {

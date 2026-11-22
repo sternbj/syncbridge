@@ -152,6 +152,8 @@ struct AIAssistant {
     // MARK: Who decides conflicts: Jev when it is on, otherwise the provider above.
 
     static var canDecide: Bool { Jev.isOn || provider != .off }
+    /// Who decides conflicts right now, e.g. "jev:~typesafe/jev-latest" or "anthropic:claude-sonnet-5-5".
+    static var deciderID: String { Jev.isOn ? "jev:\(Jev.model)" : "\(provider.rawValue):\(model(for: provider))" }
     static var decisionParallelRequests: Int { Jev.isOn ? 5 : provider.parallelRequests }
     static var decisionMaxChars: Int { Jev.isOn ? Jev.maxCharsPerVersion : provider.maxCharsPerVersion }
     /// Who receives file text for decisions; nil when it stays on this Mac.

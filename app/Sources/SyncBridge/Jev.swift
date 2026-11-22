@@ -185,7 +185,13 @@ enum Jev {
             "model": model, "state": state, "questions": questions,
         ] as [String: Any])
         let json = try await APICall.send(request, provider: .openrouter, feature: "Jev")
-        return parse(json?["answers"] as? [String: Any] ?? [:])
+        guard let answers = json?["answers"] as? [String: Any], answers["keep"] is [String: Any] else {
+            throw AIError.failed("""
+                Jev answered in an unexpected format, so its answer can't be used. OpenRouter's Decisions API \
+                may have changed; try again later or turn Jev off in Settings › AI.
+                """)
+        }
+        return parse(answers)
     }
 
     /// Turns Jev's answers into a decision with reasons; unsure answers and refusals become "ask".
