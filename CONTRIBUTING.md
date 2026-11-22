@@ -12,9 +12,13 @@ Bug reports, ideas and pull requests are welcome.
 - App: Swift package in `app/` (macOS 13+). `cd app && swift build`
 - Engine: `engine/syncbridge.py`, standard library only.
 - Tests come first for engine changes: `cd engine && python3 -m unittest discover tests`
+- App tests (Swift Testing) in `app/Tests`: `cd app && swift test`. Logic that doesn't need the UI
+  (rules, parsing, choosing) gets a test there first. They need the full Xcode app, not only the
+  Command Line Tools: run `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer` and
+  `sudo xcodebuild -license accept` once.
 - Build and install the app: `scripts/install.sh`
 
 Every pull request runs the engine tests (with the Python 3.9 that ships with macOS and with
-Python 3.13) and builds the app on GitHub. A pull request is merged only when these checks pass.
+Python 3.13), builds the app and runs the app tests on GitHub. A pull request is merged only when these checks pass.
 
 Keep changes small and focused, and describe in the pull request what you tested.

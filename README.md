@@ -48,9 +48,19 @@ deletions, and stops to ask whenever something could lose data.
   - **Claude plan** (Pro, Max) via your own signed-in Claude Code, run with all tools off;
     several accounts in `~/.claude*` folders can be picked
   - **Local model** (Ollama, LM Studio, llama.cpp) on this Mac or your network
-  - **Jev** by TypeSafe through an OpenRouter key: picks a version in about a second with a
-    probability, but gives no reasons and can't merge; below 80% it leaves the file to you
   - Apple's on-device model, or an Anthropic, OpenAI or OpenRouter API key
+
+  Optionally, **Jev** by TypeSafe (through an OpenRouter key) decides next to the provider: it
+  picks a version in about a second with a probability and gives its reasons as answers to fixed
+  questions; below 80% it leaves the file to you. The provider still explains on request
+  ("Why?") and proposes merges.
+
+  **Current models without updating the app**: once a week SyncBridge loads the model lists of
+  OpenRouter, Anthropic and OpenAI and offers text models from the last 12 months, only the
+  newest version of each family (Kimi K3 rather than K2, including open-source models on
+  OpenRouter). When a newer version of your model comes out, a notification says so; it is
+  switched only when you click Switch. Key and connection errors say what went wrong and what
+  to do (wrong or deleted key, credits used up, no access to the model, service down, offline).
 
   "Ask AI for All" asks about a few files at once, keeps the answers until a file or your
   instructions change, and sends a notification when a long run is done.
@@ -159,11 +169,13 @@ python3 engine/syncbridge.py --help
 
 ```bash
 python3 -m unittest discover -s engine/tests   # engine tests
+(cd app && swift test)                         # app tests (needs Xcode, see CONTRIBUTING.md)
 scripts/build-app.sh                           # build build/SyncBridge.app
 ```
 
 The app (`app/`, SwiftUI) only calls the engine's JSON commands; all sync logic and its
-safety rules live in `engine/syncbridge.py` and are covered by the tests.
+safety rules live in `engine/syncbridge.py` and are covered by the tests. App logic that
+stands on its own, such as the model list rules, has Swift tests in `app/Tests`.
 
 ## Feedback and contributing
 
