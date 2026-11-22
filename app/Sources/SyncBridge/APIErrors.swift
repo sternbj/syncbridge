@@ -118,6 +118,8 @@ enum APICall {
 
     /// The service's own error text, if any: keys removed first, then shortened, so no part of a key is left.
     private static func serviceMessage(_ data: Data, secrets: [String]) -> String? {
+        // A key too short to replace safely could be echoed unnoticed: then show none of the service's text.
+        guard !secrets.contains(where: { !$0.isEmpty && $0.count < 4 }) else { return nil }
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         let error = json?["error"]
         let message = (error as? [String: Any])?["message"] as? String ?? error as? String ?? json?["message"] as? String
@@ -127,7 +129,7 @@ enum APICall {
     }
 
     /// Error text is shown in Settings and notifications: never with the key in it, even if a service echoes it.
-    /// Very short values (a placeholder like "x" for a local server) would garble the text and aren't secret.
+    /// Keys shorter than 4 characters are handled in serviceMessage, which then drops the text.
     static func redact(_ text: String, secrets: [String]) -> String {
         var text = secrets.filter { $0.count >= 4 }.reduce(text) { $0.replacingOccurrences(of: $1, with: "[key]") }
         text = text.replacingOccurrences(of: #"sk-[A-Za-z0-9_\-]{8,}"#, with: "[key]", options: .regularExpression)
