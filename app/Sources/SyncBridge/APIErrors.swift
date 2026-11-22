@@ -76,7 +76,7 @@ enum APICall {
         default:
             text = "\(name) answered with error \(status)."
         }
-        if let detail = serviceMessage(data).map({ redact($0, secrets: secrets) }) { text += "\n\(name) said: \(detail)" }
+        if let detail = serviceMessage(data, secrets: secrets) { text += "\n\(name) said: \(detail)" }
         return text
     }
 
@@ -116,19 +116,20 @@ enum APICall {
 
     // MARK: Helpers
 
-    /// The service's own error text, if any.
-    private static func serviceMessage(_ data: Data) -> String? {
+    /// The service's own error text, if any: keys removed first, then shortened, so no part of a key is left.
+    private static func serviceMessage(_ data: Data, secrets: [String]) -> String? {
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         let error = json?["error"]
         let message = (error as? [String: Any])?["message"] as? String ?? error as? String ?? json?["message"] as? String
-            ?? String(data: data, encoding: .utf8).map { String($0.prefix(300)) }
-        let trimmed = String((message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").prefix(300))
+            ?? String(data: data, encoding: .utf8)
+        let trimmed = String(redact(message ?? "", secrets: secrets).trimmingCharacters(in: .whitespacesAndNewlines).prefix(300))
         return trimmed.isEmpty || trimmed.hasPrefix("<") ? nil : trimmed
     }
 
     /// Error text is shown in Settings and notifications: never with the key in it, even if a service echoes it.
+    /// Very short values (a placeholder like "x" for a local server) would garble the text and aren't secret.
     static func redact(_ text: String, secrets: [String]) -> String {
-        var text = secrets.filter { $0.count >= 8 }.reduce(text) { $0.replacingOccurrences(of: $1, with: "[key]") }
+        var text = secrets.filter { $0.count >= 4 }.reduce(text) { $0.replacingOccurrences(of: $1, with: "[key]") }
         text = text.replacingOccurrences(of: #"sk-[A-Za-z0-9_\-]{8,}"#, with: "[key]", options: .regularExpression)
         return text
     }

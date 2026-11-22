@@ -35,6 +35,12 @@ final class AppModel: ObservableObject {
     private var scheduleTimer: Timer?
     private var statusTimer: Timer?
     private var modelCheckTimer: Timer?
+    private var checkingModels = false
+    /// Counts changes of who decides or of the instructions, also A → B → A. An answer asked
+    /// under an older revision is dropped, since it may come from another model.
+    private var deciderRevision = 0
+    private var lastFingerprint = AITrust.currentFingerprint
+    private var defaultsObserver: NSObjectProtocol?
     private var watcher: FolderWatcher?
     private var watchedPairs: [PairInfo] = []
     private var changedPairs: Set<String> = []
@@ -53,6 +59,11 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.show(target) }
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.noteDeciderChange() }
+        }
         Task {
             await refreshStatus()
             scheduleSyncs()
@@ -77,16 +88,27 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func noteDeciderChange() {
+        let current = AITrust.currentFingerprint
+        guard current != lastFingerprint else { return }
+        lastFingerprint = current
+        deciderRevision += 1
+    }
+
     /// Tells the user when a newer version of the model they use is out; switching is their choice.
+    /// An upgrade counts as told only once macOS accepted the notification.
     private func checkModels() async {
+        guard !checkingModels else { return }
+        checkingModels = true
+        defer { checkingModels = false }
         for upgrade in await ModelCatalog.refresh()
         where upgrade.provider == AIAssistant.provider && ModelCatalog.isNew(upgrade) {
-            ModelCatalog.markNotified(upgrade)
-            post(EngineNotification(
+            let delivered = await deliver(EngineNotification(
                 title: "Newer AI model available",
                 message: "\(upgrade.newer) is out (you use \(upgrade.current)). Switch in Settings › AI.",
                 open: "ai"
             ))
+            if delivered { ModelCatalog.markNotified(upgrade) }
         }
     }
 
@@ -230,13 +252,24 @@ final class AppModel: ObservableObject {
     }
 
     private func post(_ notification: EngineNotification) {
+        Task { await deliver(notification) }
+    }
+
+    /// Hands the notification to macOS; false if it was refused.
+    @discardableResult
+    private func deliver(_ notification: EngineNotification) async -> Bool {
         let content = UNMutableNotificationContent()
         content.title = notification.title
         content.body = notification.message
         content.sound = .default
         content.userInfo = ["open": notification.open ?? "summary"]
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+            return true
+        } catch {
+            return false
+        }
     }
 
     // MARK: Real-time sync
@@ -315,9 +348,11 @@ final class AppModel: ObservableObject {
         defer { aiAsking.remove(conflict.id) }
         // The answer belongs to the settings it was asked with; if they change meanwhile, it is dropped.
         let fingerprint = AITrust.currentFingerprint
+        let revision = deciderRevision
         let texts = try await loadConflictTexts(conflict)
         let decision = try await AIAssistant().decide(texts, local: conflict.local, onedrive: conflict.onedrive)
-        guard AITrust.currentFingerprint == fingerprint else {
+        noteDeciderChange()
+        guard deciderRevision == revision, AITrust.currentFingerprint == fingerprint else {
             throw AIError.failed("The AI settings or instructions changed while waiting for the answer. Ask again.")
         }
         aiSuggestions[conflict.id] = decision

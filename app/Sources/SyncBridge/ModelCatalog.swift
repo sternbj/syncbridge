@@ -97,7 +97,8 @@ enum ModelCatalog {
         return newest.id
     }
 
-    /// Release dates of every model the provider lists, also old ones, to compare the current model.
+    /// Release dates of the models read from the provider's list (before the 12-month and family
+    /// rules, so also old ones), to compare the current model.
     static func releaseDates(_ models: [CatalogModel]) -> [String: Date] {
         Dictionary(models.map { ($0.id, $0.created) }, uniquingKeysWith: max)
     }
