@@ -415,10 +415,16 @@ final class AppModel: ObservableObject {
     private func decideAutomatically() async {
         let trust = AITrust.shared
         guard trust.autoDecide, trust.isEligible, AIAssistant.canDecide, !conflicts.isEmpty else { return }
+        let revision = deciderRevision
         _ = await suggestAll(notify: false)
+        // Settings may have changed while the AI answered: then nothing is applied automatically.
+        noteDeciderChange()
+        guard deciderRevision == revision, trust.autoDecide, trust.isEligible else { return }
         let batch = conflicts.filter(Self.aiCanDecide).compactMap { conflict -> ConflictDecision? in
-            guard let keep = aiSuggestions[conflict.id]?.keep, keep != "ask" else { return nil }
-            return ConflictDecision(pair: conflict.pair, file: conflict.file, keep: keep)
+            guard let saved = savedSuggestions[conflict.id], saved.fits(conflict), saved.decision.keep != "ask" else {
+                return nil
+            }
+            return ConflictDecision(pair: conflict.pair, file: conflict.file, keep: saved.decision.keep)
         }
         guard !batch.isEmpty else { return }
         let text = await resolve(batch)

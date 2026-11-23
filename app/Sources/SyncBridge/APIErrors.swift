@@ -122,8 +122,10 @@ enum APICall {
         guard !secrets.contains(where: { !$0.isEmpty && $0.count < 4 }) else { return nil }
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         let error = json?["error"]
+        // The raw body is shown only for requests without a key: escaped forms of a key (such as a JSON-escaped slash)
+        // in an unknown format would slip past redaction.
         let message = (error as? [String: Any])?["message"] as? String ?? error as? String ?? json?["message"] as? String
-            ?? String(data: data, encoding: .utf8)
+            ?? (secrets.allSatisfy(\.isEmpty) ? String(data: data, encoding: .utf8) : nil)
         let trimmed = String(redact(message ?? "", secrets: secrets).trimmingCharacters(in: .whitespacesAndNewlines).prefix(300))
         return trimmed.isEmpty || trimmed.hasPrefix("<") ? nil : trimmed
     }
