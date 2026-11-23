@@ -165,7 +165,7 @@ struct PreviewOverride: Encodable, Hashable {
 struct EngineNotification: Decodable {
     let title: String
     let message: String
-    /// Window a click opens: "summary", "conflicts" or "deletions".
+    /// Window a click opens: "summary", "conflicts", "deletions" or "ai" (Settings › AI).
     let open: String?
 }
 

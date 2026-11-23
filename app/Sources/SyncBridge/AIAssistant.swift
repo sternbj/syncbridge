@@ -6,7 +6,7 @@ import FoundationModels
 
 /// Where AI help for conflicts comes from. Cloud providers use the user's own API key.
 enum AIProvider: String, CaseIterable, Identifiable {
-    case off, chatgpt, claudeCode, apple, local, jev, anthropic, openai, openrouter
+    case off, chatgpt, claudeCode, apple, local, anthropic, openai, openrouter
 
     var id: String { rawValue }
 
@@ -20,7 +20,6 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .anthropic: return "Anthropic (API key)"
         case .openai: return "OpenAI (API key)"
         case .openrouter: return "OpenRouter (API key)"
-        case .jev: return "Jev by TypeSafe, fast decisions (OpenRouter API key)"
         }
     }
 
@@ -34,7 +33,6 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .anthropic: return "Anthropic"
         case .openai: return "OpenAI"
         case .openrouter: return "OpenRouter"
-        case .jev: return "Jev"
         case .off: return "AI"
         }
     }
@@ -45,7 +43,6 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .chatgpt, .openai: return "OpenAI"
         case .claudeCode, .anthropic: return "Anthropic"
         case .openrouter: return "OpenRouter"
-        case .jev: return "OpenRouter and TypeSafe"
         case .local: return LocalModel.serverName
         default: return "nobody"
         }
@@ -54,17 +51,12 @@ enum AIProvider: String, CaseIterable, Identifiable {
     /// How many conflicts to ask about at once. A model on this Mac shares one processor.
     var parallelRequests: Int { self == .local || self == .apple ? 1 : 3 }
 
-    var needsKey: Bool { self == .anthropic || self == .openai || self == .openrouter || self == .jev }
-    /// Jev only picks a version; merges and suggested instructions need a model that writes text.
-    var writesText: Bool { self != .jev }
-    /// Whose key is used: Jev runs on the OpenRouter key.
-    var keyAccount: String { self == .jev ? AIProvider.openrouter.rawValue : rawValue }
+    var needsKey: Bool { self == .anthropic || self == .openai || self == .openrouter }
     var isCloud: Bool { self != .off && self != .apple }
 
     var defaultModel: String {
         switch self {
         case .anthropic: return "claude-sonnet-5-5"
-        case .jev: return Jev.latestModel
         default: return ""
         }
     }
@@ -74,7 +66,6 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .anthropic: return "e.g. claude-sonnet-5-5"
         case .openai: return "model name from your OpenAI account"
         case .openrouter: return "e.g. anthropic/… or openai/… (see openrouter.ai/models)"
-        case .jev: return Jev.latestModel + " (always the newest version)"
         default: return ""
         }
     }
@@ -83,7 +74,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
         switch self {
         case .anthropic: return "https://console.anthropic.com/settings/keys"
         case .openai: return "https://platform.openai.com/api-keys"
-        case .openrouter, .jev: return "https://openrouter.ai/keys"
+        case .openrouter: return "https://openrouter.ai/keys"
         default: return ""
         }
     }
@@ -130,11 +121,11 @@ enum KeychainStore {
     }
 
     static func key(for provider: AIProvider) -> String? {
-        read(provider.keyAccount).flatMap { String(data: $0, encoding: .utf8) }
+        read(provider.rawValue).flatMap { String(data: $0, encoding: .utf8) }
     }
 
     static func setKey(_ key: String, for provider: AIProvider) {
-        write(Data(key.trimmingCharacters(in: .whitespacesAndNewlines).utf8), account: provider.keyAccount)
+        write(Data(key.trimmingCharacters(in: .whitespacesAndNewlines).utf8), account: provider.rawValue)
     }
 }
 
@@ -156,6 +147,31 @@ struct AIAssistant {
 
     static var provider: AIProvider {
         AIProvider(rawValue: UserDefaults.standard.string(forKey: providerKey) ?? "") ?? .off
+    }
+
+    // MARK: Who decides conflicts: Jev when it is on, otherwise the provider above.
+
+    static var canDecide: Bool { Jev.isOn || provider != .off }
+    /// Who decides conflicts right now, e.g. "jev:~typesafe/jev-latest" or "anthropic:claude-sonnet-5-5".
+    /// A local model includes its server, since two servers can offer models with the same name.
+    static var deciderID: String {
+        if Jev.isOn { return "jev:\(Jev.model)" }
+        let server = provider == .local ? LocalModel.serverIdentity + ":" : ""
+        return "\(provider.rawValue):\(server)\(model(for: provider))"
+    }
+    static var decisionParallelRequests: Int { Jev.isOn ? 5 : provider.parallelRequests }
+    static var decisionMaxChars: Int { Jev.isOn ? Jev.maxCharsPerVersion : provider.maxCharsPerVersion }
+    /// Who receives file text for decisions; nil when it stays on this Mac.
+    static var decisionService: String? {
+        Jev.isOn ? Jev.serviceName : provider.isCloud ? provider.serviceName : nil
+    }
+
+    /// Jev used to be a provider; it is now a separate switch next to one.
+    static func migrate() {
+        let defaults = UserDefaults.standard
+        guard defaults.string(forKey: providerKey) == "jev" else { return }
+        defaults.set(true, forKey: Jev.enabledKey)
+        defaults.set(AIProvider.off.rawValue, forKey: providerKey)
     }
 
     static func model(for provider: AIProvider) -> String {
@@ -199,11 +215,6 @@ struct AIAssistant {
             return try await completeWithApple(system: system, prompt: prompt)
         case .anthropic, .openai, .openrouter, .local:
             return try await completeInCloud(system: system, prompt: prompt)
-        case .jev:
-            throw AIError.notConfigured(
-                "Jev only picks which version to keep; it can't write text. For merges and suggested "
-                    + "instructions, choose another AI in Settings › AI."
-            )
         }
     }
 
@@ -252,13 +263,7 @@ struct AIAssistant {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let detail = (json?["error"] as? [String: Any])?["message"] as? String
-                ?? String(data: data, encoding: .utf8)?.prefix(300).description ?? ""
-            throw AIError.failed("\(provider.name) returned an error: \(detail)")
-        }
+        let json = try await APICall.send(request, provider: provider)
         let text: String?
         if provider == .anthropic {
             text = (json?["content"] as? [[String: Any]])?
@@ -285,8 +290,8 @@ struct AIAssistant {
 
     // MARK: Conflict prompts
 
-    private func versions(_ texts: ConflictTexts) -> String {
-        let limit = provider.maxCharsPerVersion
+    private func versions(_ texts: ConflictTexts, limit: Int? = nil) -> String {
+        let limit = limit ?? provider.maxCharsPerVersion
         func cut(_ text: String?) -> String {
             guard let text else { return "(this version was deleted or has no readable text)" }
             return text.count > limit ? String(text.prefix(limit)) + "\n[… shortened]" : text
@@ -313,8 +318,11 @@ struct AIAssistant {
         return text.isEmpty ? "" : "\n\nThe user's instructions, which take priority:\n\(text)"
     }
 
-    /// Which version to keep, why, and what each side changed.
-    func decide(_ texts: ConflictTexts, local: FileVersion?, onedrive: FileVersion?) async throws -> AIDecision {
+    /// Which version to keep, why, and what each side changed. Uses Jev when it is on,
+    /// unless useJev is false (to have the provider explain a Jev decision).
+    func decide(
+        _ texts: ConflictTexts, local: FileVersion?, onedrive: FileVersion?, useJev: Bool = Jev.isOn
+    ) async throws -> AIDecision {
         func when(_ version: FileVersion?) -> String {
             version.map { $0.date.formatted(date: .abbreviated, time: .shortened) } ?? "deleted"
         }
@@ -326,14 +334,14 @@ struct AIAssistant {
         at most 80 words"}. Use "ask" when both versions have their own important changes or when \
         you are not sure. Never invent content. Answer in English.\(userInstructions)
         """
-        let prompt = "Laptop saved: \(when(local)). OneDrive saved: \(when(onedrive)).\n\n" + versions(texts)
-        if provider == .jev {
-            guard let key = KeychainStore.key(for: provider) else {
-                throw AIError.notConfigured("Add your OpenRouter API key in Settings › AI.")
-            }
+        let header = "Laptop saved: \(when(local)). OneDrive saved: \(when(onedrive)).\n\n"
+        if useJev {
             let instructions = AITrust.currentInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
-            return try await Jev.decide(state: prompt, instructions: instructions, model: Self.model(for: provider), key: key)
+            return try await Jev.decide(
+                state: header + versions(texts, limit: Jev.maxCharsPerVersion), instructions: instructions
+            )
         }
+        let prompt = header + versions(texts)
         return Self.parseDecision(try await complete(system: system, prompt: prompt, quick: true))
     }
 

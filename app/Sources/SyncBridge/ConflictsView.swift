@@ -14,6 +14,7 @@ struct ConflictsView: View {
     @State private var corrections: [AICorrection] = []
     @AppStorage(AppModel.realtimeKey) private var realtime = false
     @AppStorage(AIAssistant.providerKey) private var aiProvider = AIProvider.off.rawValue
+    @AppStorage(Jev.enabledKey) private var jevOn = false
 
     private var selected: Conflict? { model.conflicts.first { $0.id == selection } }
 
@@ -50,7 +51,7 @@ struct ConflictsView: View {
 
     // MARK: Bulk actions
 
-    private var aiOn: Bool { AIProvider(rawValue: aiProvider) ?? .off != .off }
+    private var aiOn: Bool { jevOn || AIProvider(rawValue: aiProvider) ?? .off != .off }
 
     private var bulkBar: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -219,23 +220,29 @@ struct ConflictsView: View {
                     ProgressView().controlSize(.small)
                     Text("AI is reading both versions…").font(.caption).foregroundStyle(.secondary)
                 }
-                if provider == .off {
+                if !aiOn {
                     Button("Set Up AI…") {
                         model.settingsTab = "ai"
                         model.show("settings")
                     }
                 } else {
-                    Button("Ask AI") { Task { await askAI(conflict) } }
+                    Button(jevOn ? "Ask Jev" : "Ask AI") { Task { await askAI(conflict) } }
                         .disabled(aiBusy != nil || model.aiWorking || !AppModel.aiCanDecide(conflict))
                         .help(AppModel.aiCanDecide(conflict) ? "" : "Deletions and name conflicts are always yours to decide.")
-                    if conflict.analysis?.mergeable == true, provider.writesText {
+                    if jevOn, provider != .off, model.aiSuggestions[conflict.id] != nil {
+                        Button("Why? Ask \(provider.name)") { Task { await explain(conflict) } }
+                            .disabled(aiBusy != nil)
+                            .help("Jev only ticks fixed reasons. \(provider.name) reads both versions and explains what each side changed.")
+                    }
+                    if conflict.analysis?.mergeable == true, provider != .off {
                         Button("Propose Merge…") { Task { await proposeMerge(conflict) } }
                             .disabled(aiBusy != nil)
                     }
                 }
             }
-            if provider.isCloud {
-                Text("Sends the text of both versions of this file to \(provider.serviceName).")
+            if let service = AIAssistant.decisionService {
+                Text("Asking sends the text of both versions of this file to \(service)."
+                     + (jevOn && provider.isCloud ? " Why and merges go to \(provider.serviceName)." : ""))
                     .font(.caption).foregroundStyle(.secondary)
             }
             if provider != .off, conflict.analysis?.mergeable != true, conflict.analysis?.suggestion == "merge" {
@@ -278,6 +285,19 @@ struct ConflictsView: View {
         aiAnswers[conflict.id] = nil
         do {
             try await model.suggest(conflict)
+        } catch {
+            aiAnswers[conflict.id] = "AI help failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func explain(_ conflict: Conflict) async {
+        aiBusy = conflict.id
+        defer { aiBusy = nil }
+        do {
+            let view = try await model.explain(conflict)
+            let provider = AIProvider(rawValue: aiProvider) ?? .off
+            aiAnswers[conflict.id] = "\(provider.name) would \(view.keep == "ask" ? "leave it to you" : "choose " + conflict.keepTitle(view.keep)): \(view.reason)"
+                + (view.changes.isEmpty ? "" : "\n\n\(view.changes)")
         } catch {
             aiAnswers[conflict.id] = "AI help failed: \(error.localizedDescription)"
         }

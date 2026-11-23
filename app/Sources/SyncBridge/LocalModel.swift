@@ -22,6 +22,15 @@ enum LocalModel {
 
     static var baseURL: URL? { validURL(address) }
 
+    /// The server as one string: scheme and host are case-insensitive, the path is not
+    /// (a proxy can serve different models at /TeamA/v1 and /teama/v1).
+    static var serverIdentity: String {
+        guard let url = baseURL, var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return "" }
+        parts.scheme = parts.scheme?.lowercased()
+        parts.host = parts.host?.lowercased()
+        return parts.string ?? url.absoluteString
+    }
+
     /// "localhost:11434"
     static var serverName: String {
         guard let url = baseURL, let host = url.host else { return "your local model server" }

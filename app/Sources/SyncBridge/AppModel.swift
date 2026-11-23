@@ -34,6 +34,13 @@ final class AppModel: ObservableObject {
     let engine = Engine()
     private var scheduleTimer: Timer?
     private var statusTimer: Timer?
+    private var modelCheckTimer: Timer?
+    private var checkingModels = false
+    /// Counts changes of who decides or of the instructions, also A → B → A. An answer asked
+    /// under an older revision is dropped, since it may come from another model.
+    private var deciderRevision = 0
+    private var lastFingerprint = AITrust.currentFingerprint
+    private var defaultsObserver: NSObjectProtocol?
     private var watcher: FolderWatcher?
     private var watchedPairs: [PairInfo] = []
     private var changedPairs: Set<String> = []
@@ -44,6 +51,7 @@ final class AppModel: ObservableObject {
     private let notificationDelegate = NotificationDelegate()
 
     init() {
+        AIAssistant.migrate()
         UNUserNotificationCenter.current().delegate = notificationDelegate
         WindowActivation.shared.start()
         AppDelegate.onReopen = { [weak self] in self?.show("settings") }
@@ -51,6 +59,11 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.show(target) }
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.noteDeciderChange() }
+        }
         Task {
             await refreshStatus()
             scheduleSyncs()
@@ -67,6 +80,35 @@ final class AppModel: ObservableObject {
         }
         statusTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { await self?.refreshStatus() }
+        }
+        // The model lists are downloaded once a week; looking every few hours catches a Mac that slept.
+        Task { await checkModels() }
+        modelCheckTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            Task { await self?.checkModels() }
+        }
+    }
+
+    private func noteDeciderChange() {
+        let current = AITrust.currentFingerprint
+        guard current != lastFingerprint else { return }
+        lastFingerprint = current
+        deciderRevision += 1
+    }
+
+    /// Tells the user when a newer version of the model they use is out; switching is their choice.
+    /// An upgrade counts as told only once macOS accepted the notification.
+    private func checkModels() async {
+        guard !checkingModels else { return }
+        checkingModels = true
+        defer { checkingModels = false }
+        for upgrade in await ModelCatalog.refresh()
+        where upgrade.provider == AIAssistant.provider && ModelCatalog.isNew(upgrade) {
+            let delivered = await deliver(EngineNotification(
+                title: "Newer AI model available",
+                message: "\(upgrade.newer) is out (you use \(upgrade.current)). Switch in Settings › AI.",
+                open: "ai"
+            ))
+            if delivered { ModelCatalog.markNotified(upgrade) }
         }
     }
 
@@ -210,13 +252,24 @@ final class AppModel: ObservableObject {
     }
 
     private func post(_ notification: EngineNotification) {
+        Task { await deliver(notification) }
+    }
+
+    /// Hands the notification to macOS; false if it was refused.
+    @discardableResult
+    private func deliver(_ notification: EngineNotification) async -> Bool {
         let content = UNMutableNotificationContent()
         content.title = notification.title
         content.body = notification.message
         content.sound = .default
         content.userInfo = ["open": notification.open ?? "summary"]
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+            return true
+        } catch {
+            return false
+        }
     }
 
     // MARK: Real-time sync
@@ -267,7 +320,8 @@ final class AppModel: ObservableObject {
     }
 
     func loadConflictTexts(_ conflict: Conflict) async throws -> ConflictTexts {
-        let limit = String(AIAssistant.provider.maxCharsPerVersion)
+        // Long enough for whoever reads it; each prompt shortens to its own model's size.
+        let limit = String(max(AIAssistant.decisionMaxChars, AIAssistant.provider.maxCharsPerVersion))
         return try await engine.decode(
             ConflictTexts.self, ["--conflict-texts", conflict.pair, conflict.file, "--max-chars", limit]
         )
@@ -292,15 +346,28 @@ final class AppModel: ObservableObject {
     func suggest(_ conflict: Conflict) async throws -> AIDecision {
         aiAsking.insert(conflict.id)
         defer { aiAsking.remove(conflict.id) }
+        // The answer belongs to the settings it was asked with; if they change meanwhile, it is dropped.
+        let fingerprint = AITrust.currentFingerprint
+        let revision = deciderRevision
         let texts = try await loadConflictTexts(conflict)
         let decision = try await AIAssistant().decide(texts, local: conflict.local, onedrive: conflict.onedrive)
+        noteDeciderChange()
+        guard deciderRevision == revision, AITrust.currentFingerprint == fingerprint else {
+            throw AIError.failed("The AI settings or instructions changed while waiting for the answer. Ask again.")
+        }
         aiSuggestions[conflict.id] = decision
         savedSuggestions[conflict.id] = SavedSuggestion(
-            decision: decision, local: conflict.local, onedrive: conflict.onedrive,
-            instructions: AITrust.fingerprint(AITrust.currentInstructions)
+            decision: decision, local: conflict.local, onedrive: conflict.onedrive, instructions: fingerprint
         )
         AITrust.save(savedSuggestions, to: AITrust.supportFile("ai-suggestions.json"))
         return decision
+    }
+
+    /// The AI provider's own view of a conflict, with reasons, e.g. to explain what Jev decided.
+    /// Not saved and not counted: Jev's suggestion stays the one that is measured.
+    func explain(_ conflict: Conflict) async throws -> AIDecision {
+        let texts = try await loadConflictTexts(conflict)
+        return try await AIAssistant().decide(texts, local: conflict.local, onedrive: conflict.onedrive, useJev: false)
     }
 
     /// Asks the AI about every open conflict it may decide, a few at a time, skipping those it
@@ -315,7 +382,7 @@ final class AppModel: ObservableObject {
         defer { aiProgress = nil }
         aiQueue = Array(queue)
         aiFailure = nil
-        let workers = (0..<AIAssistant.provider.parallelRequests).map { _ in Task { await aiWorker() } }
+        let workers = (0..<AIAssistant.decisionParallelRequests).map { _ in Task { await aiWorker() } }
         for worker in workers { await worker.value }
         let failure = aiFailure
         if notify, let failure, Date().timeIntervalSince(started) > 20 {
@@ -347,11 +414,17 @@ final class AppModel: ObservableObject {
     /// After a sync, with automatic decisions on: the AI resolves the conflicts it is sure about.
     private func decideAutomatically() async {
         let trust = AITrust.shared
-        guard trust.autoDecide, trust.isEligible, AIAssistant.provider != .off, !conflicts.isEmpty else { return }
+        guard trust.autoDecide, trust.isEligible, AIAssistant.canDecide, !conflicts.isEmpty else { return }
+        let revision = deciderRevision
         _ = await suggestAll(notify: false)
+        // Settings may have changed while the AI answered: then nothing is applied automatically.
+        noteDeciderChange()
+        guard deciderRevision == revision, trust.autoDecide, trust.isEligible else { return }
         let batch = conflicts.filter(Self.aiCanDecide).compactMap { conflict -> ConflictDecision? in
-            guard let keep = aiSuggestions[conflict.id]?.keep, keep != "ask" else { return nil }
-            return ConflictDecision(pair: conflict.pair, file: conflict.file, keep: keep)
+            guard let saved = savedSuggestions[conflict.id], saved.fits(conflict), saved.decision.keep != "ask" else {
+                return nil
+            }
+            return ConflictDecision(pair: conflict.pair, file: conflict.file, keep: saved.decision.keep)
         }
         guard !batch.isEmpty else { return }
         let text = await resolve(batch)
@@ -427,6 +500,11 @@ final class AppModel: ObservableObject {
 
     /// Shows an app window ("conflicts", "deletions", "preview", "settings") or the last summary.
     func show(_ target: String) {
+        if target == "ai" {
+            settingsTab = "ai"
+            show("settings")
+            return
+        }
         if target == "summary" {
             open(status?.summaryFile)
             return

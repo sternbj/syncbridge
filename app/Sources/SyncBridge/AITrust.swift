@@ -27,7 +27,7 @@ struct SavedSuggestion: Codable {
 
     func fits(_ conflict: Conflict) -> Bool {
         local == conflict.local && onedrive == conflict.onedrive
-            && instructions == AITrust.fingerprint(AITrust.currentInstructions)
+            && instructions == AITrust.currentFingerprint
     }
 }
 
@@ -81,6 +81,12 @@ final class AITrust: ObservableObject {
         UserDefaults.standard.string(forKey: instructionsKey) ?? ""
     }
 
+    /// The instructions plus who decides (Jev or the provider, with its model): switching either
+    /// starts the count again, and saved answers from another decider no longer fit.
+    nonisolated static var currentFingerprint: String {
+        fingerprint(currentInstructions + "\n#decider:" + AIAssistant.deciderID)
+    }
+
     nonisolated static func fingerprint(_ text: String) -> String {
         SHA256.hash(data: Data(text.trimmingCharacters(in: .whitespacesAndNewlines).utf8))
             .prefix(8).map { String(format: "%02x", $0) }.joined()
@@ -103,7 +109,7 @@ final class AITrust: ObservableObject {
     /// Records that count: the last 30 days, made with the current instructions.
     var window: [AIRecord] {
         let since = Date().addingTimeInterval(-Double(Self.windowDays) * 86_400)
-        let current = Self.fingerprint(instructions)
+        let current = Self.currentFingerprint
         return records.filter { $0.date >= since && $0.instructions == current }
     }
 
@@ -151,7 +157,7 @@ final class AITrust: ObservableObject {
     /// Saves the user's decisions next to the AI's suggestions. Returns the disagreements.
     @discardableResult
     func record(_ outcomes: [(file: String, ai: String, user: String)]) -> [(file: String, ai: String, user: String)] {
-        let current = Self.fingerprint(instructions)
+        let current = Self.currentFingerprint
         let new = outcomes.filter { $0.ai != "ask" }.map {
             AIRecord(date: Date(), file: $0.file, ai: $0.ai, user: $0.user, instructions: current)
         }

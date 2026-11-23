@@ -68,7 +68,7 @@ struct AIInstructionsView: View {
             kept until a file or your instructions change, so after editing the instructions, try \
             again until the answers match what you would do; then decide in \
             the Conflicts window, where "Use AI Suggestions" fills in its choices for you to check.
-            """ + (provider.isCloud ? " The text of each file is sent to \(provider.serviceName)." : ""))
+            """ + (AIAssistant.decisionService.map { " The text of each file is sent to \($0)." } ?? ""))
             .font(.caption).foregroundStyle(.secondary)
         }
 
@@ -97,7 +97,7 @@ struct AIInstructionsView: View {
             conflicts after each sync where it is sure and both versions exist; deletions, name \
             conflicts and merges always wait for you. Overwritten versions are kept as set under \
             Deletions & Versions, and a notification lists what the AI decided.
-            """ + (provider.isCloud ? " File text is then sent to \(provider.serviceName) during syncs." : ""))
+            """ + (AIAssistant.decisionService.map { " File text is then sent to \($0) during syncs." } ?? ""))
             .font(.caption).foregroundStyle(.secondary)
         }
     }
