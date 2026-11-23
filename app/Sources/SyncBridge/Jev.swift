@@ -96,8 +96,14 @@ enum Jev {
 
     /// A probability from Jev's answer, or nil if it is missing, not finite or outside 0…1.
     private static func probability(_ value: Any?) -> Double? {
-        guard let value = value as? Double, value.isFinite, (0...1).contains(value) else { return nil }
-        return value
+        number(value).flatMap { (0...1).contains($0) ? $0 : nil }
+    }
+
+    /// A finite JSON number. Foundation also turns JSON true/false into numbers; those are rejected.
+    private static func number(_ value: Any?) -> Double? {
+        guard let value = value as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID(),
+              value.doubleValue.isFinite else { return nil }
+        return value.doubleValue
     }
 
     /// What Jev is clear about, from the answers to the side questions. Unclear answers,
@@ -117,7 +123,7 @@ enum Jev {
         }
         /// Which side a five-step scale leans to and how far (0 to 2), from `least` on.
         func lean(_ key: String, least: Double) -> (side: String, clearly: Bool)? {
-            guard let score = answer(key, "score")?["score"] as? Double, score.isFinite, (0...4).contains(score),
+            guard let score = number(answer(key, "score")?["score"]), (0...4).contains(score),
                   abs(score - 2) >= least else { return nil }
             return (score < 2 ? "local" : "onedrive", abs(score - 2) >= 1.5)
         }

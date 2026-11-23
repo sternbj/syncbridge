@@ -156,7 +156,7 @@ struct AIAssistant {
     /// A local model includes its server, since two servers can offer models with the same name.
     static var deciderID: String {
         if Jev.isOn { return "jev:\(Jev.model)" }
-        let server = provider == .local ? (LocalModel.baseURL?.absoluteString.lowercased() ?? "") + ":" : ""
+        let server = provider == .local ? LocalModel.serverIdentity + ":" : ""
         return "\(provider.rawValue):\(server)\(model(for: provider))"
     }
     static var decisionParallelRequests: Int { Jev.isOn ? 5 : provider.parallelRequests }
