@@ -92,7 +92,13 @@ enum Jev {
 
     private static let sides = ["local": "Laptop", "onedrive": "OneDrive"]
     private static func other(_ side: String) -> String { side == "local" ? "onedrive" : "local" }
-    private static func percent(_ probability: Double) -> Int { Int((probability * 100).rounded()) }
+    private static func percent(_ probability: Double) -> Int { Int((min(max(probability, 0), 1) * 100).rounded()) }
+
+    /// A probability from Jev's answer, or nil if it is missing, not finite or outside 0…1.
+    private static func probability(_ value: Any?) -> Double? {
+        guard let value = value as? Double, value.isFinite, (0...1).contains(value) else { return nil }
+        return value
+    }
 
     /// What Jev is clear about, from the answers to the side questions. Unclear answers,
     /// refusals and missing answers are left out.
@@ -101,17 +107,18 @@ enum Jev {
             let answer = answers[key] as? [String: Any]
             return answer?["type"] as? String == type ? answer : nil
         }
-        func yes(_ key: String) -> Double { answer(key, "noul")?["noul"] as? Double ?? 0 }
+        func yes(_ key: String) -> Double { probability(answer(key, "noul")?["noul"]) ?? 0 }
         /// The chosen option, if Jev is at least 80% sure of it.
         func choice(_ key: String) -> (option: String, probability: Double)? {
             guard let answer = answer(key, "choice"), let option = answer["choice"] as? String,
-                  let probability = (answer["probabilities"] as? [String: Any])?[option] as? Double,
+                  let probability = probability((answer["probabilities"] as? [String: Any])?[option]),
                   probability >= minimumProbability else { return nil }
             return (option, probability)
         }
         /// Which side a five-step scale leans to and how far (0 to 2), from `least` on.
         func lean(_ key: String, least: Double) -> (side: String, clearly: Bool)? {
-            guard let score = answer(key, "score")?["score"] as? Double, abs(score - 2) >= least else { return nil }
+            guard let score = answer(key, "score")?["score"] as? Double, score.isFinite, (0...4).contains(score),
+                  abs(score - 2) >= least else { return nil }
             return (score < 2 ? "local" : "onedrive", abs(score - 2) >= 1.5)
         }
 
@@ -201,7 +208,8 @@ enum Jev {
               let choice = answer["choice"] as? String, options[choice] != nil else {
             return AIDecision(keep: "ask", reason: "Jev gave no answer for this file.")
         }
-        let probability = (answer["probabilities"] as? [String: Any])?[choice] as? Double ?? 0
+        // A missing or invalid probability counts as unsure, so the user decides.
+        let probability = probability((answer["probabilities"] as? [String: Any])?[choice]) ?? 0
         let title = AIDecision(keep: choice, reason: "").title
         if choice == "ask" {
             return AIDecision(

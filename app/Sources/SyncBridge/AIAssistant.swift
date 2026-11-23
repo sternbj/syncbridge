@@ -153,7 +153,12 @@ struct AIAssistant {
 
     static var canDecide: Bool { Jev.isOn || provider != .off }
     /// Who decides conflicts right now, e.g. "jev:~typesafe/jev-latest" or "anthropic:claude-sonnet-5-5".
-    static var deciderID: String { Jev.isOn ? "jev:\(Jev.model)" : "\(provider.rawValue):\(model(for: provider))" }
+    /// A local model includes its server, since two servers can offer models with the same name.
+    static var deciderID: String {
+        if Jev.isOn { return "jev:\(Jev.model)" }
+        let server = provider == .local ? (LocalModel.baseURL?.absoluteString.lowercased() ?? "") + ":" : ""
+        return "\(provider.rawValue):\(server)\(model(for: provider))"
+    }
     static var decisionParallelRequests: Int { Jev.isOn ? 5 : provider.parallelRequests }
     static var decisionMaxChars: Int { Jev.isOn ? Jev.maxCharsPerVersion : provider.maxCharsPerVersion }
     /// Who receives file text for decisions; nil when it stays on this Mac.
