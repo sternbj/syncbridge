@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import time
 import sys
 import tempfile
 import unittest
@@ -1074,24 +1075,25 @@ class AppInterfaceTests(unittest.TestCase):
 
 
 
+def core_xml(author="", revision=1):
+    """The save metadata of an Office file."""
+
+    return (
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties">'
+        f"<cp:lastModifiedBy>{author}</cp:lastModifiedBy><cp:revision>{revision}</cp:revision>"
+        "</cp:coreProperties>"
+    )
+
+
 def office_file(paragraphs, author="", revision=1):
     """A minimal Word file with the given paragraphs and save metadata."""
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr(
-            "docProps/core.xml",
-            '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties">'
-            f"<cp:lastModifiedBy>{author}</cp:lastModifiedBy><cp:revision>{revision}</cp:revision>"
-            "</cp:coreProperties>",
-        )
-        body = "".join(f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in paragraphs)
-        archive.writestr(
-            "word/document.xml",
-            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-            f"<w:body>{body}</w:body></w:document>",
-        )
-    return buffer.getvalue()
+    body = "".join(f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in paragraphs)
+    return zip_file({
+        "docProps/core.xml": core_xml(author, revision),
+        "word/document.xml": '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{body}</w:body></w:document>",
+    })
 
 
 class ConflictAnalysisTests(unittest.TestCase):
@@ -1189,7 +1191,75 @@ class ConflictAnalysisTests(unittest.TestCase):
 
         result = self.analysis("plan.docx")
 
+        # The damaged laptop file is newer, but the intact OneDrive file is the one to keep.
+        self.assertEqual(result["suggestion"], "onedrive")
+        self.assertEqual(result["confidence"], "high")
+        self.assertIn("damaged", result["reason"])
+
+    def test_same_text_with_other_pictures_names_the_pictures(self):
+        self.make_conflict(
+            "plan.docx",
+            local=word_file(["Scope"], image=b"picture one"),
+            cloud=word_file(["Scope"], image=b"picture two"),
+        )
+
+        result = self.analysis("plan.docx")
+
+        self.assertIn("pictures", result["reason"])
+        self.assertNotIn("only formatting", result["reason"])
+
+    def test_same_text_with_other_links_does_not_say_only_formatting(self):
+        links = "word/_rels/document.xml.rels"
+        self.make_conflict(
+            "plan.docx",
+            local=word_file(["Scope"], parts={links: "https://a.example"}),
+            cloud=word_file(["Scope"], parts={links: "https://b.example"}),
+        )
+
+        result = self.analysis("plan.docx")
+
         self.assertEqual(result["confidence"], "low")
+        self.assertIn("links", result["reason"])
+        self.assertNotIn("only formatting", result["reason"])
+
+    def test_date_in_the_future_is_named_and_decides_nothing(self):
+        self.make_conflict(
+            "plan.docx",
+            local=office_file(["Scope"], revision=3),
+            cloud=office_file(["Scope"], revision=4),
+            cloud_time=int(time.time()) + 3600,
+        )
+
+        result = self.analysis("plan.docx")
+
+        self.assertIsNone(result["suggestion"])
+        self.assertIn("future", result["reason"])
+
+    def test_text_that_stops_in_the_middle_of_a_line_looks_cut_off(self):
+        self.make_conflict(
+            "notes.md",
+            local=b"intro\nthe plan",
+            cloud=b"intro\nthe plan is to grow\nend\n",
+        )
+
+        result = self.analysis("notes.md")
+
+        self.assertEqual(result["suggestion"], "onedrive")
+        self.assertEqual(result["confidence"], "medium")
+        self.assertIn("cut off", result["reason"])
+
+    def test_excel_analysis_sees_changed_numbers(self):
+        self.make_conflict(
+            "plan.xlsx",
+            local=excel_file({"A1": ("s", 0), "B1": 10}, ("Total",)),
+            cloud=excel_file({"A1": ("s", 0), "B1": 99}, ("Total",)),
+        )
+
+        result = self.analysis("plan.xlsx")
+
+        self.assertEqual(result["suggestion"], "merge")
+        self.assertIn("sheet1!B1: 10", sync.document_paragraphs(self.local / "plan.xlsx"))
+        self.assertIn("sheet1!A1: Total", sync.document_paragraphs(self.local / "plan.xlsx"))
 
     def test_edit_against_deletion_gets_no_suggestion(self):
         self.make_conflict("plan.md", local=b"edited\n", cloud=None)
@@ -1963,6 +2033,20 @@ class FolderRuleTests(OptionTestBase):
         self.assertIn("cloud", sync.office_info(self.local / "report.docx")["paragraphs"])
         self.assertEqual(len(self.backups("local", "report.docx")), 1)
 
+    def test_author_priority_reads_only_the_save_metadata(self):
+        self.rules(authors=("Alice Example", "Bob Example"))
+        broken_sheet = {"xl/worksheets/sheet1.xml": "<worksheet><unclosed>"}
+        local, cloud = (
+            zip_file({"docProps/core.xml": core_xml(author), **broken_sheet})
+            for author in ("Bob Example", "Alice Example")
+        )
+        previous = self.edit_both("budget.xlsx", local, cloud)
+
+        result = self.run_pair(previous)
+
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual((self.local / "budget.xlsx").read_bytes(), cloud)
+
     def test_author_priority_with_the_same_author_leaves_the_conflict_open(self):
         self.rules(authors=("Alice Example", "Bob Example"))
         previous = self.edit_both_office("report.docx", "Alice Example", "Alice Example")
@@ -2063,6 +2147,284 @@ class FolderRuleTests(OptionTestBase):
         ):
             errors = sync.validate_config_payload({"pairs": pairs, **payload})
             self.assertTrue(any(field in error for error in errors), (payload, errors))
+
+
+def zip_file(parts):
+    """An Office-style package with the given parts (name -> text or bytes)."""
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def excel_file(cells, strings=()):
+    """A minimal Excel file: cells maps a reference to a number, "=formula" or (cell type, value),
+    e.g. ("s", string index) or ("b", 1) for TRUE."""
+
+    def cell(reference, value):
+        if isinstance(value, tuple):
+            return f'<c r="{reference}" t="{value[0]}"><v>{value[1]}</v></c>'
+        if str(value).startswith("="):
+            return f'<c r="{reference}"><f>{value[1:]}</f><v>0</v></c>'
+        return f'<c r="{reference}"><v>{value}</v></c>'
+
+    namespace = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+    return zip_file({
+        "xl/sharedStrings.xml": f"<sst {namespace}>" + "".join(f"<si><t>{text}</t></si>" for text in strings) + "</sst>",
+        "xl/worksheets/sheet1.xml": f"<worksheet {namespace}><sheetData><row>"
+        + "".join(cell(reference, value) for reference, value in cells.items())
+        + "</row></sheetData></worksheet>",
+    })
+
+
+def word_file(paragraphs, header="", image=b"", revision=1, parts=None):
+    """A Word file with a header and an embedded image next to the body text, plus any other parts."""
+
+    extra = parts or {}
+    namespace = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    body = "".join(f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>" for text in paragraphs)
+    parts = {
+        "docProps/core.xml": core_xml(revision=revision),
+        "word/document.xml": f"<w:document {namespace}><w:body>{body}</w:body></w:document>",
+        "word/header1.xml": f"<w:hdr {namespace}><w:p><w:r><w:t>{header}</w:t></w:r></w:p></w:hdr>",
+    }
+    if image:
+        parts["word/media/image1.png"] = image
+    return zip_file({**parts, **extra})
+
+
+class SafeRuleTests(OptionTestBase):
+    """The conflict rule "safe": decide only where no content can be lost, leave the rest open."""
+
+    edit_both = FolderRuleTests.edit_both
+    backups = FolderRuleTests.backups
+    OLD, NEW = 1700000000, 1700090000
+    PNG = b"\x89PNG\r\n\x1a\n picture data \x00\x00\x00\x00IEND\xaeB`\x82"
+
+    def setUp(self):
+        super().setUp()
+        sync.CONFIG.conflict_rule = "safe"
+
+    def resolve(self, name, local, cloud, local_time=OLD, cloud_time=NEW):
+        """Runs a sync with this conflict; returns the kept side, or None if it stays open."""
+
+        previous = self.edit_both(name, local, cloud, local_time, cloud_time)
+        result = self.run_pair(previous)
+        if any(conflict["file"] == name for conflict in result["conflicts"]):
+            self.assertEqual((self.local / name).read_bytes(), local)
+            self.assertEqual((self.cloud / name).read_bytes(), cloud)
+            return None
+        kept = (self.local / name).read_bytes()
+        self.assertEqual(kept, (self.cloud / name).read_bytes())
+        side = "local" if kept == local else "onedrive"
+        # The overwritten version is kept, as for every rule.
+        self.assertEqual(len(self.backups("onedrive" if side == "local" else "local", name)), 1)
+        return side
+
+    def test_same_text_with_other_formatting_keeps_the_newer_version(self):
+        local = office_file(["Scope", "Timeline"], revision=3)
+        cloud = office_file(["Scope", "Timeline"], revision=4)
+        self.assertEqual(self.resolve("plan.docx", local, cloud), "onedrive")
+
+    def test_same_content_saved_in_the_same_second_stays_open(self):
+        local = office_file(["Scope"], revision=3)
+        cloud = office_file(["Scope"], revision=4)
+        self.assertIsNone(self.resolve("plan.docx", local, cloud, local_time=self.OLD, cloud_time=self.OLD))
+
+    def test_newer_version_that_only_adds_content_is_kept(self):
+        local = b"intro\nplan\nnew risk\nnew owner\n"
+        self.assertEqual(self.resolve("notes.md", local, b"intro\nplan\n", self.NEW, self.OLD), "local")
+
+    def test_older_version_with_more_content_stays_open(self):
+        # The newer side may have removed the lines on purpose.
+        self.assertIsNone(self.resolve("notes.md", b"intro\nplan\nrisk\n", b"intro\nplan\n"))
+
+    def test_own_changes_on_both_sides_stay_open(self):
+        self.assertIsNone(self.resolve("notes.md", b"intro\nlocal idea\n", b"intro\ncloud idea\n"))
+
+    def test_reordered_or_repeated_lines_stay_open(self):
+        self.assertIsNone(self.resolve("a.md", b"one\ntwo\nthree\n", b"two\none\nthree\nfour\n"))
+        self.assertIsNone(self.resolve("b.md", b"one\none\ntwo\n", b"one\ntwo\n"))
+
+    def test_line_endings_bom_and_accent_form_do_not_count(self):
+        local = ("﻿Title\r\n\r\n" + unicodedata.normalize("NFD", "Café text") + "\r\n").encode()
+        cloud = "Title\n\nCafé text\n".encode()
+        self.assertEqual(self.resolve("notes.md", local, cloud), "onedrive")
+
+    def test_trailing_spaces_blank_lines_and_unreadable_characters_count(self):
+        # Two trailing spaces are a line break in Markdown, a blank line separates paragraphs.
+        self.assertIsNone(self.resolve("a.md", b"Title  \nText\n", b"Title\nText\n"))
+        # The newer version removed the blank line: not the same, and not only an addition.
+        self.assertIsNone(self.resolve("b.md", b"Title\n\nText\n", b"Title\nText\n"))
+        self.assertIsNone(self.resolve("c.md", b"Title\n\xff\n", b"Title\n\xfe\n"))
+        self.assertIsNone(self.resolve("d.md", b"Title\n", b"Title\n\xff\n"))
+        # Only CRLF and LF end a line; a lone CR inside a quoted CSV field is a value.
+        self.assertIsNone(self.resolve("e.csv", b'"A\rB",1\n', b'"A\nB",1\n'))
+
+    def test_changed_indentation_stays_open(self):
+        self.assertIsNone(self.resolve("job.yml", b"steps:\n  run: test\n", b"steps:\nrun: test\n"))
+
+    def test_json_with_other_layout_but_the_same_data_keeps_the_newer_version(self):
+        local = b'{"name": "x", "tags": [1, 2]}'
+        cloud = b'{\n  "tags": [1, 2],\n  "name": "x"\n}\n'
+        self.assertEqual(self.resolve("data.json", local, cloud), "onedrive")
+        self.assertIsNone(self.resolve("other.json", b'{"tags": [1, 2]}', b'{"tags": [2, 1]}'))
+
+    def test_json_types_duplicate_keys_and_deep_nesting_stay_open(self):
+        self.assertIsNone(self.resolve("a.json", b'{"on": true}', b'{"on": 1}'))
+        # An added line with a known key changes the value read, it does not only add.
+        self.assertIsNone(self.resolve("b.json", b'{\n"on": true\n}\n', b'{\n"on": true,\n"on": false\n}\n'))
+        deep = b"[" * 1500 + b"]" * 1500
+        self.assertIsNone(self.resolve("c.json", deep, b"[ " * 1500 + b"]" * 1500))
+        self.assertIsNone(self.resolve("d.json", b'{"x": 1.00000000000000001}', b'{"x": 1.00000000000000002}'))
+        nfc, nfd = (unicodedata.normalize(form, "\u00e9") for form in ("NFC", "NFD"))
+        two_keys = json.dumps({nfc: 1, nfd: 2}, ensure_ascii=False).encode()
+        repeated = ('{"%s": 1, "%s": 2}' % (nfc, nfc)).encode()
+        self.assertIsNone(self.resolve("e.json", two_keys, repeated))
+
+    def test_empty_or_damaged_file_loses_even_when_it_is_newer(self):
+        pdf = b"%PDF-1.7\ncontent\n%%EOF\n"
+        cases = {
+            "broken.docx": (office_file(["Scope"]), b"not a zip"),
+            "empty.xlsx": (excel_file({"A1": 1}), b""),
+            "empty.jpg": (b"\xff\xd8 picture \xff\xd9", b""),
+            "cut.pdf": (pdf, pdf[:14]),
+            "cut.png": (self.PNG, self.PNG[:9]),
+            # The end marker of an earlier image, then the copy stopped.
+            "middle.png": (self.PNG, self.PNG + b" cut off image dat"),
+            # The zip directory is intact, but a part's bytes do not match its checksum.
+            "checksum.docx": (office_file(["Scope"]), office_file(["Scope"]).replace(b"Scope", b"Scopf")),
+        }
+        for name, (intact, damaged) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.resolve(name, intact, damaged), "local")
+
+    def test_two_damaged_files_stay_open(self):
+        self.assertIsNone(self.resolve("plan.docx", b"not a zip", b"also broken"))
+
+    def test_files_that_only_look_damaged_stay_open(self):
+        # A password-protected Office file is not a zip file, but it is not damaged.
+        encrypted = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 600
+        self.assertIsNone(self.resolve("plan.docx", office_file(["Scope"]), encrypted))
+        # Files that may be empty or shorter on purpose: a marker file, a trimmed log.
+        self.assertIsNone(self.resolve("COMPLETE", b"done", b""))
+        lines = b"".join(b'{"n": %d}\n' % n for n in range(5000))
+        self.assertIsNone(self.resolve("events.jsonl", lines, lines[:20_000]))
+        # A song cut at a frame boundary is the beginning of the full one, and still playable.
+        song = bytes(range(256)) * 400
+        self.assertIsNone(self.resolve("song.mp3", song, song[:50_000]))
+        # Neither zip file opens, so the longer one is no complete copy either.
+        self.assertIsNone(self.resolve("files.zip", b"abcdef", b"abc"))
+
+    def test_zip_files_with_unreadable_names_count_as_damaged_without_stopping_the_sync(self):
+        broken = zip_file({"aé.txt": "x"}).replace("é".encode(), b"\xff\xfe")
+        self.assertIsNone(self.resolve("files.zip", broken, broken + b"\x00"))
+        self.assertEqual(self.resolve("plan.docx", office_file(["Scope"]), broken), "local")
+
+    def test_saves_less_than_a_second_apart_count_as_the_same_time(self):
+        local, cloud = office_file(["Scope"], revision=3), office_file(["Scope"], revision=4)
+        self.assertIsNone(self.resolve("plan.docx", local, cloud, self.OLD + 0.97, self.OLD + 1.03))
+
+    def test_emptied_text_file_stays_open_unless_the_full_one_is_newer(self):
+        self.assertIsNone(self.resolve("notes.md", b"intro\nplan\n", b""))
+        self.assertEqual(self.resolve("later.md", b"", b"intro\nplan\n"), "onedrive")
+
+    def test_incomplete_copy_of_a_file_without_text_loses_even_when_it_is_newer(self):
+        video = bytes(range(256)) * 600
+        self.assertEqual(self.resolve("clip.mp4", video, video[:70_000]), "local")
+        self.assertIsNone(self.resolve("other.mp4", video, video[:70_000] + b"different end"))
+
+    def test_excel_numbers_and_formulas_count_as_content(self):
+        strings = ("Total",)
+        base = excel_file({"A1": ("s", 0), "B1": 10, "C1": "=B1*2"}, strings)
+        self.assertIsNone(self.resolve("a.xlsx", base, excel_file({"A1": ("s", 0), "B1": 99, "C1": "=B1*2"}, strings)))
+        self.assertIsNone(self.resolve("b.xlsx", base, excel_file({"A1": ("s", 0), "B1": 10, "C1": "=B1*3"}, strings)))
+        added = excel_file({"A1": ("s", 0), "B1": 10, "C1": "=B1*2", "D1": 5}, strings)
+        self.assertIsNone(self.resolve("c.xlsx", base, added))
+        self.assertIsNone(self.resolve("d.xlsx", excel_file({"A1": ("b", 1)}), excel_file({"A1": 1})))
+
+    def test_word_headers_and_images_count_as_content(self):
+        base = word_file(["Scope"], header="Draft", image=b"picture one")
+        self.assertIsNone(self.resolve("a.docx", base, word_file(["Scope"], header="Final", image=b"picture one")))
+        self.assertIsNone(self.resolve("b.docx", base, word_file(["Scope"], header="Draft", image=b"picture two")))
+        same = word_file(["Scope"], header="Draft", image=b"picture one", revision=2)
+        self.assertEqual(self.resolve("c.docx", base, same), "onedrive")
+
+    def test_office_files_count_as_the_same_only_when_just_the_metadata_differs(self):
+        links = "word/_rels/document.xml.rels"
+        old = word_file(["Scope"], parts={links: '<Relationships><Relationship Target="https://a.example"/></Relationships>'})
+        new = word_file(["Scope"], parts={links: '<Relationships><Relationship Target="https://b.example"/></Relationships>'})
+        self.assertIsNone(self.resolve("link.docx", old, new))
+        # The same picture moved to another slide: same text, same media, other relations.
+        slide = "ppt/slides/_rels/slide{}.xml.rels"
+        picture = {"ppt/media/image1.png": "picture"}
+        first = zip_file({**picture, slide.format(1): "image1.png", slide.format(2): "none"})
+        second = zip_file({**picture, slide.format(1): "none", slide.format(2): "image1.png"})
+        self.assertIsNone(self.resolve("deck.pptx", first, second))
+        # Custom properties (a retention period, a classification) are content.
+        custom = "docProps/custom.xml"
+        self.assertIsNone(self.resolve("kept.docx", word_file(["Scope"], parts={custom: "1 year"}),
+                                       word_file(["Scope"], parts={custom: "10 years"})))
+
+    def test_deletions_and_name_conflicts_stay_open(self):
+        self.write_both("plan.md", b"base")
+        previous = self.baseline()
+        (self.local / "plan.md").unlink()
+        (self.cloud / "plan.md").write_bytes(b"base\nedited\n")
+        self.assertEqual(len(self.run_pair(previous)["conflicts"]), 1)
+        name_conflict = {"pair": "Test", "file": "A.md", "related_file": "a.md", "reason": "x"}
+        self.assertIsNone(sync.rule_decision(self.pair, name_conflict, "safe"))
+
+    def test_folder_rules_still_come_first(self):
+        sync.CONFIG.folder_rules = (sync.FolderRule("Drafts/**", "keep_older"),)
+        local = office_file(["Scope"], revision=3)
+        cloud = office_file(["Scope"], revision=4)
+        self.assertEqual(self.resolve("Drafts/plan.docx", local, cloud), "local")
+
+    # Names that differ only by capitalisation or the Unicode form of "ä"
+
+    def test_name_conflicts_stay_open_with_every_rule(self):
+        local, cloud = office_file(["Scope"], revision=3), office_file(["Scope"], revision=4)
+        for index, rule in enumerate(("safe", "newer", "local", "onedrive")):
+            names = (
+                (f"r{index}.docx", f"R{index}.docx"),
+                tuple(unicodedata.normalize(form, f"Qualität{index}.docx") for form in ("NFC", "NFD")),
+            )
+            for local_name, cloud_name in names:
+                with self.subTest(rule=rule, name=cloud_name):
+                    sync.CONFIG.conflict_rule = rule
+                    previous = self.baseline()
+                    for base, name, content, stamp in (
+                        (self.local, local_name, local, self.OLD), (self.cloud, cloud_name, cloud, self.NEW)
+                    ):
+                        (base / name).write_bytes(content)
+                        os.utime(base / name, (stamp, stamp))
+                    result = self.run_pair(previous)
+                    self.assertTrue(any(c["file"] == local_name for c in result["conflicts"]))
+                    self.assertEqual((self.local / local_name).read_bytes(), local)
+                    self.assertEqual((self.cloud / cloud_name).read_bytes(), cloud)
+
+    # A clock that is wrong makes "newer" meaningless
+
+    def test_version_dated_in_the_future_is_not_treated_as_newer(self):
+        future = int(time.time()) + 3600
+        local, cloud = office_file(["Scope"], revision=3), office_file(["Scope"], revision=4)
+        self.assertIsNone(self.resolve("plan.docx", local, cloud, cloud_time=future))
+        sync.CONFIG.conflict_rule = "newer"
+        self.assertIsNone(self.resolve("other.docx", local, cloud, cloud_time=future))
+
+    def test_damaged_file_is_replaced_even_with_a_date_in_the_future(self):
+        future = int(time.time()) + 3600
+        self.assertEqual(self.resolve("plan.docx", office_file(["Scope"]), b"not a zip", cloud_time=future), "local")
+
+    def test_text_file_that_stops_in_the_middle_of_a_line_stays_open(self):
+        self.assertIsNone(self.resolve("notes.md", b"intro\nthe plan is to grow\nend\n", b"intro\nthe plan"))
+
+    def test_safe_is_a_valid_conflict_rule(self):
+        self.assertIn("safe", sync.CONFLICT_RULES)
+        self.assertEqual(sync.config_choice_errors({"conflict_rule": "safe"}), [])
 
 
 class NameConflictResolutionTests(unittest.TestCase):

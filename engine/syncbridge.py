@@ -25,6 +25,7 @@ import time
 import unicodedata
 import re
 import zipfile
+import zlib
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -139,8 +140,9 @@ UNREADABLE_LIMIT_RATIO = 0.01
 # OneDrive deletions go to the OneDrive recycle bin instead.
 TRASH_RETENTION_DAYS = 30
 DEFAULT_SYNC_INTERVAL_MINUTES = 60
-# ask: keep conflicts open for review; newer/local/onedrive: resolve automatically.
-CONFLICT_RULES = ("ask", "newer", "local", "onedrive")
+# ask: keep conflicts open for review; newer/local/onedrive: resolve automatically;
+# safe: resolve only where no content can be lost (see safe_decision), keep the rest open.
+CONFLICT_RULES = ("ask", "safe", "newer", "local", "onedrive")
 DEFAULT_AUTO_DELETE_LIMIT = 50
 
 # Sync variants as in FreeFileSync. Every variant is a mapping from the six
@@ -904,7 +906,7 @@ def copy_for_action(
     """Run a copy action; the replaced target version is kept per deletion handling."""
 
     target = "onedrive" if action == "copy_local_to_onedrive" else "local"
-    source = "local" if target == "onedrive" else "onedrive"
+    source = other_side(target)
     return copy_file(
         side_dir(pair, source),
         side_dir(pair, target),
@@ -1065,7 +1067,7 @@ def delete_from_side(
     try:
         keep_version(pair, side, rel_path, move=True)
         log_msg(f"  Deleted ({require_config().deletion_handling}): {rel_path}", verbose)
-        other = side_dir(pair, "local" if side == "onedrive" else "onedrive")
+        other = side_dir(pair, other_side(side))
         remove_empty_parents(base, rel_path, keep_if_in=other)
         return True
     except Exception as exc:
@@ -1243,15 +1245,38 @@ def version_info(path: Path) -> dict | None:
     return {"modified": int(stat.st_mtime), "size": stat.st_size}
 
 
+# A save date further ahead than this comes from a wrong clock; "newer" then means nothing.
+CLOCK_TOLERANCE_SECONDS = 300
+
+
+def in_future(version: dict | None) -> bool:
+    return version is not None and version["modified"] > time.time() + CLOCK_TOLERANCE_SECONDS
+
+
+def versions_of(paths: dict[str, Path]) -> tuple[dict | None, dict | None, str | None]:
+    """Return (local, onedrive, newer side); no side is newer within a second or when a
+    date lies in the future."""
+
+    local, onedrive = version_info(paths["local"]), version_info(paths["onedrive"])
+    if not local or not onedrive or in_future(local) or in_future(onedrive):
+        return local, onedrive, None
+    try:
+        # Exact times: two saves 0.1 s apart can fall on either side of a whole second.
+        gap = paths["local"].stat().st_mtime - paths["onedrive"].stat().st_mtime
+    except OSError:
+        return local, onedrive, None
+    newer = None if abs(gap) < 1 else ("local" if gap > 0 else "onedrive")
+    return local, onedrive, newer
+
+
+def conflict_paths(pair: SyncPair, rel_path: str) -> dict[str, Path]:
+    return {"local": pair.local_dir / rel_path, "onedrive": pair.onedrive_dir / rel_path}
+
+
 def conflict_versions(pair: SyncPair, rel_path: str) -> tuple[dict | None, dict | None, str | None]:
     """Return (local, onedrive, newer side) for a conflicted path."""
 
-    local = version_info(pair.local_dir / rel_path)
-    onedrive = version_info(pair.onedrive_dir / rel_path)
-    newer = None
-    if local and onedrive and abs(local["modified"] - onedrive["modified"]) >= 1:
-        newer = "local" if local["modified"] > onedrive["modified"] else "onedrive"
-    return local, onedrive, newer
+    return versions_of(conflict_paths(pair, rel_path))
 
 
 def conflict_versions_text(pair: SyncPair, rel_path: str) -> str:
@@ -1304,20 +1329,66 @@ def conflict_diff_preview(pair: SyncPair, rel_path: str, max_lines: int = 12) ->
 # --- Conflict analysis (suggestions without AI, texts for AI help) ---
 
 SIDE_LABELS = {"local": "The laptop version", "onedrive": "The OneDrive version"}
-# Office file -> (XML parts holding the text, tag of one paragraph or cell text)
+# Office file -> (XML parts holding the content, tag of one paragraph or cell)
 OFFICE_TEXT_PARTS = {
-    ".docx": (("word/document.xml",), "p"),
-    ".pptx": (("ppt/slides/",), "p"),
-    ".xlsx": (("xl/sharedStrings.xml",), "si"),
+    ".docx": (
+        ("word/document.xml", "word/header", "word/footer", "word/footnotes.xml", "word/endnotes.xml", "word/comments.xml"),
+        "p",
+    ),
+    ".pptx": (("ppt/slides/", "ppt/notesSlides/"), "p"),
+    ".xlsx": (("xl/worksheets/",), "c"),
 }
+EXCEL_STRINGS_PART = "xl/sharedStrings.xml"
+# Save details of an Office file (author, revision, dates, editing time); saving again
+# changes only these. Custom properties (docProps/custom.xml) are content.
+OFFICE_METADATA_PARTS = ("docProps/core.xml", "docProps/app.xml")
+# A password-protected Office file is no zip package but an OLE file starting with this.
+OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+# Media files that are never empty; a shorter copy that matches the start of the other
+# version was interrupted. Text-like formats are left out: they may be shortened on purpose.
+MEDIA_SUFFIXES = {
+    ".jpg", ".jpeg", ".heic", ".gif", ".tif", ".tiff", ".webp",
+    ".mp4", ".mov", ".m4v", ".mp3", ".m4a", ".wav", ".zip",
+}
+NEVER_EMPTY_SUFFIXES = MEDIA_SUFFIXES | set(OFFICE_TEXT_PARTS) | {".pdf", ".png"}
+# An MP3 cut at a frame boundary is the beginning of the full song and still plays.
+INTERRUPTED_COPY_SUFFIXES = MEDIA_SUFFIXES - {".mp3"}
+# Larger files are not compared byte by byte when looking for an interrupted copy.
+INCOMPLETE_COPY_LIMIT = 512 * 1024 * 1024
+PNG_END = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+# Text formats where inserted lines only add; in code or settings an added line can
+# change what the existing lines mean (a repeated key, an early return).
+ADDITIVE_TEXT_SUFFIXES = {".txt", ".md", ".csv", ".log"}
+# Reading a zip file that is damaged inside, or whose names are no valid text.
+ZIP_ERRORS = (zipfile.BadZipFile, ValueError, EOFError, zlib.error)
+# Marks a JSON number with a fraction, kept as written: float() rounds 1.00000000000000001 to 1.0.
+JSON_FRACTION = "\0fraction:"
 
 
 def xml_local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def office_info(path: Path) -> dict | None:
-    """Last author, revision and paragraphs of a Word, PowerPoint or Excel file."""
+def xml_text(element: ElementTree.Element) -> str:
+    return "".join(part.text or "" for part in element.iter() if xml_local_name(part.tag) == "t").strip()
+
+
+def excel_cell_text(cell: ElementTree.Element, sheet: str, strings: list[str]) -> str:
+    """One Excel cell as "sheet1!B2: content"; a formula counts instead of its last result."""
+
+    parts = {xml_local_name(child.tag): child.text or "" for child in cell}
+    if parts.get("f"):
+        content = "=" + parts["f"]
+    elif cell.get("t") == "s" and parts.get("v", "").isdigit() and int(parts["v"]) < len(strings):
+        content = strings[int(parts["v"])]
+    else:
+        content = parts.get("v") or xml_text(cell)
+    return f"{sheet}!{cell.get('r', '')}: {content}" if content.strip() else ""
+
+
+def office_info(path: Path, content: bool = True) -> dict | None:
+    """Last author and revision of an Office file; with content also its paragraphs
+    (Excel: cells)."""
 
     spec = OFFICE_TEXT_PARTS.get(path.suffix.lower())
     if spec is None:
@@ -1326,14 +1397,20 @@ def office_info(path: Path) -> dict | None:
     try:
         with zipfile.ZipFile(path) as archive:
             names = sorted(archive.namelist())
-            meta = {"author": None, "revision": None}
+            info = {"author": None, "revision": None}
             if "docProps/core.xml" in names:
                 for element in ElementTree.fromstring(archive.read("docProps/core.xml")).iter():
                     name = xml_local_name(element.tag)
                     if name == "lastModifiedBy" and element.text:
-                        meta["author"] = element.text.strip()
+                        info["author"] = element.text.strip()
                     elif name == "revision" and (element.text or "").strip().isdigit():
-                        meta["revision"] = int(element.text.strip())
+                        info["revision"] = int(element.text.strip())
+            if not content:
+                return info
+            strings = []
+            if paragraph_tag == "c" and EXCEL_STRINGS_PART in names:
+                root = ElementTree.fromstring(archive.read(EXCEL_STRINGS_PART))
+                strings = [xml_text(item) for item in root.iter() if xml_local_name(item.tag) == "si"]
             paragraphs = []
             for name in names:
                 if not name.startswith(prefixes) or not name.endswith(".xml"):
@@ -1341,14 +1418,29 @@ def office_info(path: Path) -> dict | None:
                 for element in ElementTree.fromstring(archive.read(name)).iter():
                     if xml_local_name(element.tag) != paragraph_tag:
                         continue
-                    text = "".join(
-                        part.text or "" for part in element.iter() if xml_local_name(part.tag) == "t"
-                    ).strip()
+                    text = excel_cell_text(element, Path(name).stem, strings) if paragraph_tag == "c" else xml_text(element)
                     if text:
                         paragraphs.append(text)
-    except (OSError, zipfile.BadZipFile, ElementTree.ParseError, KeyError):
+    except (OSError, ElementTree.ParseError, KeyError, *ZIP_ERRORS):
         return None
-    return {**meta, "paragraphs": paragraphs}
+    return {**info, "paragraphs": paragraphs}
+
+
+def text_lines(path: Path, strict: bool = False) -> list[str] | None:
+    """Lines of a text file. Line endings, a BOM and the way accents are stored never count;
+    unless strict, neither do trailing spaces, blank lines and unreadable characters.
+    Strict reading gives None for a file that is not valid UTF-8."""
+
+    try:
+        data = path.read_bytes()
+        text = unicodedata.normalize("NFC", data.decode("utf-8-sig", errors="strict" if strict else "replace"))
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not strict:
+        return [line.rstrip() for line in text.splitlines() if line.strip()]
+    # Only CRLF and LF end a line; a lone CR (inside a quoted CSV field) is part of the text.
+    lines = text.replace("\r\n", "\n").split("\n")
+    return lines[:-1] if lines[-1] == "" else lines
 
 
 def document_paragraphs(path: Path) -> list[str] | None:
@@ -1357,12 +1449,186 @@ def document_paragraphs(path: Path) -> list[str] | None:
     if path.suffix.lower() in OFFICE_TEXT_PARTS:
         info = office_info(path)
         return info["paragraphs"] if info else None
-    if not is_text_file(path.name):
+    return text_lines(path) if is_text_file(path.name) else None
+
+
+def file_health(path: Path) -> str | None:
+    """"intact" or "damaged" for a file whose type shows it, None when it can't be told.
+
+    Damaged: an empty file of a type that is never empty, an Office or zip file that does
+    not open or whose parts fail their checksum, a PDF without its end marker or a PNG that
+    does not end with its end chunk.
+    """
+
+    suffix = path.suffix.lower()
+    if suffix not in NEVER_EMPTY_SUFFIXES:
         return None
     try:
-        return [line for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+        size = path.stat().st_size
+        if size == 0:
+            return "damaged"
+        with path.open("rb") as handle:
+            if suffix in OFFICE_TEXT_PARTS and handle.read(len(OLE_SIGNATURE)) == OLE_SIGNATURE:
+                return None
+            handle.seek(max(0, size - 1024))
+            tail = handle.read()
+        if suffix in OFFICE_TEXT_PARTS or suffix == ".zip":
+            with zipfile.ZipFile(path) as archive:
+                if archive.testzip() is not None:
+                    return "damaged"
+        elif (suffix == ".pdf" and b"%%EOF" not in tail) or (suffix == ".png" and not tail.endswith(PNG_END)):
+            return "damaged"
+    except ZIP_ERRORS:
+        return "damaged"
+    except (OSError, NotImplementedError, RuntimeError):
+        # Unreadable, or a compression or encryption Python can't check.
+        return None
+    return "intact"
+
+
+def other_side(side: str) -> str:
+    return "onedrive" if side == "local" else "local"
+
+
+def intact_side(paths: dict[str, Path]) -> str | None:
+    """The side to keep when one version is shown to be intact and the other damaged."""
+
+    health = {side: file_health(path) for side, path in paths.items()}
+    for side in ("local", "onedrive"):
+        if health[side] == "intact" and health[other_side(side)] == "damaged":
+            return side
+    return None
+
+
+def is_incomplete_copy(short: Path, full: Path) -> bool:
+    """True when the media file `short` is only the beginning of `full`, as after an
+    interrupted copy, and `full` is not damaged itself."""
+
+    if short.suffix.lower() not in INTERRUPTED_COPY_SUFFIXES or file_health(full) == "damaged":
+        return False
+    try:
+        size, full_size = short.stat().st_size, full.stat().st_size
+        if not 0 < size < full_size <= INCOMPLETE_COPY_LIMIT:
+            return False
+        with short.open("rb") as a, full.open("rb") as b:
+            while chunk := a.read(1 << 20):
+                if chunk != b.read(len(chunk)):
+                    return False
+        return True
+    except OSError:
+        return False
+
+
+def cut_off_side(paths: dict[str, Path]) -> str | None:
+    """The side whose text file is the beginning of the other one and stops mid-line."""
+
+    if not all(is_text_file(path.name) for path in paths.values()):
+        return None
+    try:
+        texts = {side: path.read_text(encoding="utf-8-sig", errors="replace") for side, path in paths.items()}
     except OSError:
         return None
+    for side, other in (("local", "onedrive"), ("onedrive", "local")):
+        short, full = texts[side], texts[other]
+        if short and len(short) < len(full) and full.startswith(short) \
+                and not short.endswith("\n") and full[len(short)] != "\n":
+            return side
+    return None
+
+
+def office_parts(path: Path) -> dict[str, tuple[int, int]] | None:
+    """Checksum and size of every part of an Office file except its save details."""
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return {
+                item.filename: (item.CRC, item.file_size)
+                for item in archive.infolist()
+                if item.filename not in OFFICE_METADATA_PARTS
+            }
+    except (OSError, *ZIP_ERRORS):
+        return None
+
+
+def json_data(path: Path) -> str | None:
+    """The data of a JSON file in one fixed layout, or None when it is no clean JSON
+    (also with a repeated key, where readers disagree on the value)."""
+
+    def without_repeated_keys(pairs: list[tuple[str, object]]) -> dict:
+        if len({key for key, _ in pairs}) < len(pairs):
+            raise ValueError("repeated key")
+        return dict(pairs)
+
+    try:
+        data = json.loads(
+            path.read_bytes().decode("utf-8-sig"),
+            object_pairs_hook=without_repeated_keys,
+            parse_float=lambda text: JSON_FRACTION + text,
+        )
+        # dumps tells true from 1 and 1 from 1.0, which == does not.
+        return json.dumps(data, sort_keys=True)
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def same_known(read, paths: dict[str, Path]) -> bool:
+    """True when `read` gives the same, readable result for both versions."""
+
+    local = read(paths["local"])
+    return local is not None and local == read(paths["onedrive"])
+
+
+def same_content(paths: dict[str, Path]) -> bool:
+    """True when both versions hold the same content: an Office file saved again (only its
+    save details differ), JSON with the same data in another layout, or another text file
+    with other line endings, BOM or accent storage."""
+
+    suffix = paths["local"].suffix.lower()
+    if suffix in OFFICE_TEXT_PARTS:
+        return same_known(office_parts, paths)
+    if suffix == ".json":
+        # Not compared as text: storing accents alike could merge two keys into a repeated one.
+        return same_known(json_data, paths)
+    return is_text_file(paths["local"].name) and same_known(lambda path: text_lines(path, strict=True), paths)
+
+
+def only_adds(older: list[str], newer: list[str]) -> bool:
+    """True when `newer` is `older` with units inserted: same order, nothing removed."""
+
+    rest = iter(newer)
+    return all(unit in rest for unit in older)
+
+
+def safe_decision(pair: SyncPair, conflict: dict) -> tuple[str | None, str]:
+    """Decide a conflict only where no content can be lost; returns (side, reason).
+
+    Kept: the intact version when the other is empty or damaged, the complete media file
+    when the other is an interrupted copy, and the newer version when it has the same
+    content or, in plain text, only adds lines. Name conflicts, deletions, same-second
+    saves, dates in the future and everything else stay open.
+    """
+
+    if conflict.get("related_file"):
+        return None, ""
+    paths = conflict_paths(pair, conflict["file"])
+    local, onedrive, newer = versions_of(paths)
+    if local is None or onedrive is None:
+        return None, ""
+    if intact := intact_side(paths):
+        return intact, "the other version is empty or damaged"
+    for side in ("local", "onedrive"):
+        if is_incomplete_copy(paths[other_side(side)], paths[side]):
+            return side, "the other version is an incomplete copy"
+    if newer is None:
+        return None, ""
+    if same_content(paths):
+        return newer, "same content, newer version"
+    if paths["local"].suffix.lower() in ADDITIVE_TEXT_SUFFIXES:
+        lines = {side: text_lines(path, strict=True) for side, path in paths.items()}
+        old_lines, new_lines = lines[other_side(newer)], lines[newer]
+        if old_lines is not None and new_lines is not None and only_adds(old_lines, new_lines):
+            return newer, "the newer version only adds lines"
+    return None, ""
 
 
 def plural(count: int, unit: str) -> str:
@@ -1372,8 +1638,8 @@ def plural(count: int, unit: str) -> str:
 def analyze_conflict(pair: SyncPair, rel_path: str) -> dict:
     """Suggest which version to keep, with a confidence and a reason (no AI)."""
 
-    local, onedrive, newer = conflict_versions(pair, rel_path)
-    paths = {"local": pair.local_dir / rel_path, "onedrive": pair.onedrive_dir / rel_path}
+    paths = conflict_paths(pair, rel_path)
+    local, onedrive, newer = versions_of(paths)
     infos = {side: office_info(path) if path.exists() else None for side, path in paths.items()}
     result = {
         "suggestion": None,
@@ -1400,8 +1666,14 @@ def analyze_conflict(pair: SyncPair, rel_path: str) -> dict:
     if local is None or onedrive is None:
         deleted = "laptop" if local is None else "OneDrive"
         return suggest(None, "", f"The file was deleted on the {deleted} and edited on the other side. Decide whether the edit or the deletion wins.")
-    newer_text = f"{SIDE_LABELS[newer]} is newer." if newer else "Both have the same date."
-    texts = {side: document_paragraphs(path) for side, path in paths.items()}
+    future = [side for side, version in (("local", local), ("onedrive", onedrive)) if in_future(version)]
+    if future:
+        newer_text = f"{SIDE_LABELS[future[0]]} is dated in the future, so it is unclear which one is newer."
+    else:
+        newer_text = f"{SIDE_LABELS[newer]} is newer." if newer else "Both have the same date."
+    if intact := intact_side(paths):
+        return suggest(intact, "high", f"{SIDE_LABELS[other_side(intact)]} is empty or damaged.")
+    texts = {side: infos[side]["paragraphs"] if infos[side] else document_paragraphs(path) for side, path in paths.items()}
     if texts["local"] is None or texts["onedrive"] is None:
         return suggest(newer, "low", f"The content can't be compared. {newer_text}")
     unit = "line" if is_text_file(rel_path) else "paragraph"
@@ -1411,6 +1683,12 @@ def analyze_conflict(pair: SyncPair, rel_path: str) -> dict:
         for side, other in (("local", "onedrive"), ("onedrive", "local"))
     }
     if not only["local"] and not only["onedrive"]:
+        if infos["local"] and infos["onedrive"] and not same_known(office_parts, paths):
+            return suggest(
+                newer,
+                "low",
+                f"Both versions have the same text, but other parts differ, such as pictures, links or layout. {newer_text}",
+            )
         return suggest(newer, "medium", f"Both versions have the same text; only formatting, order or metadata differs. {newer_text}")
     for side, other in (("local", "onedrive"), ("onedrive", "local")):
         if not only[other]:
@@ -1419,6 +1697,12 @@ def analyze_conflict(pair: SyncPair, rel_path: str) -> dict:
                 "high",
                 f"{SIDE_LABELS[side]} contains everything in the other version plus {plural(len(only[side]), unit)} more.",
             )
+    if cut := cut_off_side(paths):
+        return suggest(
+            other_side(cut),
+            "medium",
+            f"{SIDE_LABELS[cut]} looks cut off: it stops in the middle of a line that the other version continues.",
+        )
     return suggest(
         "merge",
         "high",
@@ -1978,6 +2262,8 @@ def rule_decision(pair: SyncPair, conflict: dict, rule: str) -> str | None:
 
     if rule == "ask" or conflict.get("related_file"):
         return None
+    if rule == "safe":
+        return safe_decision(pair, conflict)[0]
     local, onedrive, newer = conflict_versions(pair, conflict["file"])
     if rule == "newer":
         if local is None or onedrive is None:
@@ -2017,7 +2303,7 @@ def author_decision(pair: SyncPair, rel_path: str) -> str | None:
     ranking = [name.casefold() for name in require_config().author_priority]
     ranks = {}
     for side in ("local", "onedrive"):
-        info = office_info(side_dir(pair, side) / rel_path)
+        info = office_info(side_dir(pair, side) / rel_path, content=False)
         author = (info or {}).get("author") or ""
         if author.strip().casefold() not in ranking:
             return None
@@ -2042,7 +2328,7 @@ def fixed_rule_decision(pair: SyncPair, conflict: dict) -> tuple[str | None, str
         if keep:
             return keep, rule
     if rule == "keep_older" and local and onedrive and newer:
-        return ("onedrive" if newer == "local" else "local"), rule
+        return other_side(newer), rule
     if local and onedrive and require_config().author_priority:
         keep = author_decision(pair, rel_path)
         if keep:
@@ -2068,7 +2354,10 @@ def resolve_conflicts_for_run(
     open_conflicts: list[dict] = []
     for conflict in conflicts:
         keep, reason = fixed_rule_decision(pair, conflict)
-        if keep is None:
+        if keep is None and rule == "safe":
+            keep, detail = safe_decision(pair, conflict)
+            reason = f"safe: {detail}"
+        elif keep is None:
             keep, reason = rule_decision(pair, conflict, rule), rule
         if keep is None:
             open_conflicts.append(conflict)
@@ -3747,7 +4036,7 @@ def apply_name_resolution(pair: SyncPair, conflict: dict, keep: str) -> list[str
     if keep not in {"local", "onedrive"}:
         raise ValueError(f"Invalid direction: {keep}. Use 'local' or 'onedrive'.")
     names = {"local": conflict["file"], "onedrive": conflict["related_file"]}
-    other = "onedrive" if keep == "local" else "local"
+    other = other_side(keep)
     kept_rel, other_rel = names[keep], names[other]
     source = side_dir(pair, keep) / kept_rel
     target = side_dir(pair, other) / other_rel

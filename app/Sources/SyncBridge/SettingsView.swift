@@ -86,6 +86,7 @@ struct SettingsView: View {
             Section("Everything else") {
                 Picker("When a file changed on both sides", selection: $draft.conflictRule) {
                     Text("Ask me").tag("ask")
+                    Text("Resolve the safe cases, ask me about the rest").tag("safe")
                     Text("Keep the newer version").tag("newer")
                     Text("Always keep the local version").tag("local")
                     Text("Always keep the cloud version").tag("onedrive")
@@ -93,9 +94,13 @@ struct SettingsView: View {
                 .pickerStyle(.radioGroup)
                 Text("""
                 Applies to two-way sync when no rule above decides. The version that is overwritten \
-                is kept as set under Deletions & Versions, so nothing is lost. If one side was deleted \
-                and the other edited, "newer" keeps the edited file; a rule never deletes a file. Name \
-                conflicts and edits made within the same second always wait for you. Mirror and update \
+                is kept as set under Deletions & Versions (not with "Delete permanently"). If one side was deleted \
+                and the other edited, "newer" keeps the edited file; a rule never deletes a file. \
+                "Safe cases" are: one version is empty or damaged, a picture or video is an interrupted \
+                copy, the newer one has the same content (an Office file only saved again, a text file \
+                with other line endings), or a plain text file only got new lines. Name conflicts and edits \
+                made within the same second always wait for you, and a date in the future (a wrong clock) \
+                never counts as newer. Mirror and update \
                 pairs have no conflicts: their direction decides.
                 """)
                 .font(.caption).foregroundStyle(.secondary)

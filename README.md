@@ -24,8 +24,23 @@ deletions, and stops to ask whenever something could lose data.
   Alternatively move to the macOS Trash or delete permanently.
 - **Fail-safe copies**: files are copied to a temporary name first, so an interrupted copy
   never damages the target.
-- **Conflict rules** (two way): ask, keep the newer version, always keep local, or always
-  keep the cloud version. The overwritten version is versioned first.
+- **Conflict rules** (two way): ask, resolve the safe cases only, keep the newer version,
+  always keep local, or always keep the cloud version. The overwritten version is versioned
+  first (with "delete permanently" it is not kept). "Safe cases" need no judgement: one
+  version is shown to be damaged (an empty picture, video or Office file, an Office or zip
+  file that does not open or fails its checksums, a PDF or PNG without its end; a
+  password-protected Office file is not damaged), one picture, video or zip file is an
+  interrupted copy of the other (not MP3: a shortened song can look the same), or the newer
+  version has the same content or only adds to the older one. Same content means: an Office
+  file saved again where only its save details (author, revision, dates) differ, custom
+  properties count; a text file with other line endings, BOM or accent
+  storage (trailing spaces and blank lines count); JSON with the same data in another
+  layout. Only adding means: plain text (`.txt`, `.md`, `.csv`, `.log`) with lines inserted
+  and none changed or removed. Everything else stays open, also name conflicts, deletions,
+  same-second saves and dates in the future (a wrong clock), which never count as newer.
+  A damaged version loses whatever its date.
+  A text file that stops in the middle of a line the other version continues is shown as
+  "looks cut off", but stays yours to decide.
 - **Conflict window** with modification dates, sizes, a short diff for text files and
   bulk actions ("Keep newer for all").
 - **Suggestions without AI**: SyncBridge reads the text, last author and revision of
@@ -116,7 +131,7 @@ in the app; the file format is:
 | Key | Meaning |
 |---|---|
 | `pairs` | List of folder pairs, see below |
-| `conflict_rule` | `ask`, `newer`, `local` or `onedrive` |
+| `conflict_rule` | `ask`, `safe` (decide only where no content can be lost), `newer`, `local` or `onedrive` |
 | `folder_rules` | Fixed rules per folder, checked first: `[{"pattern": "Clients/**", "rule": "protect"}]`. Rules: `protect` (never delete; a deleted file is copied back), `keep_local`, `keep_onedrive`, `keep_newer`, `keep_older` (decide conflicts). The first match counts |
 | `author_priority` | Names, highest rank first. When both versions of a Word, Excel or PowerPoint file were last saved by listed people, the higher-ranked one's version is kept |
 | `auto_delete_limit` | New deletions applied automatically per run (0 = always review) |
