@@ -2455,6 +2455,25 @@ class NameConflictResolutionTests(unittest.TestCase):
         sync.sync_all(no_delete=True)
         self.assertEqual(sync.load_conflicts(), [])
 
+    def test_first_sync_keeps_a_name_conflict_open(self):
+        (self.local / "report.md").write_bytes(b"local content")
+        (self.cloud / "Report.md").write_bytes(b"cloud content")
+        (self.local / "notes.md").write_bytes(b"same content")
+        (self.cloud / "Notes.md").write_bytes(b"same content")
+
+        sync.sync_all(no_delete=True)
+
+        conflicts = [(c["file"], c.get("related_file")) for c in sync.load_conflicts()]
+        self.assertEqual(conflicts, [("report.md", "Report.md")])
+        self.assertEqual(sorted(os.listdir(self.local)), ["notes.md", "report.md"])
+        self.assertEqual(sorted(os.listdir(self.cloud)), ["Notes.md", "Report.md"])
+        self.assertEqual((self.local / "report.md").read_bytes(), b"local content")
+        self.assertEqual((self.cloud / "Report.md").read_bytes(), b"cloud content")
+        (self.cloud / "Notes.md").unlink()
+        (self.local / "notes.md").unlink()
+        sync.resolve_conflicts_batch([{"pair": "Test", "file": "report.md", "keep": "onedrive"}])
+        self.assert_settled("Report.md", b"cloud content")
+
     def test_keep_local_settles_invisible_unicode_name_difference(self):
         nfc = unicodedata.normalize("NFC", "Qualität.docx")
         nfd = unicodedata.normalize("NFD", "Qualität.docx")

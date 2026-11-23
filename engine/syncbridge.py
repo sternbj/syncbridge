@@ -2107,8 +2107,13 @@ def initial_sync(
     verbose: bool = False,
     dry_run: bool = False,
 ) -> tuple[list[str], list[str], list[dict], list[str]]:
-    all_files = set(current_local.keys()) | set(current_onedrive.keys())
-    conflicts = []
+    # Copying a name that differs only by case or Unicode form would overwrite the other
+    # side's file under its own spelling, so these pairs wait (or are already in sync).
+    name_conflicts, name_paths = find_name_mismatch_conflicts(current_local, current_onedrive)
+    conflicts = [{"pair": pair.key, **conflict} for conflict in name_conflicts]
+    for conflict in conflicts:
+        log_msg(f"  CONFLICT [{pair.name}]: {conflict['file']} ({conflict['reason']})", verbose)
+    all_files = (set(current_local) | set(current_onedrive)) - name_paths
     to_onedrive_files = []
     to_local_files = []
     failed_paths = []
