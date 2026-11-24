@@ -1075,13 +1075,14 @@ class AppInterfaceTests(unittest.TestCase):
 
 
 
-def core_xml(author="", revision=1):
-    """The save metadata of an Office file."""
+def core_xml(author="", revision=1, title=""):
+    """The document properties of an Office file: save details and a title."""
 
     return (
-        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties">'
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"'
+        ' xmlns:dc="http://purl.org/dc/elements/1.1/">'
         f"<cp:lastModifiedBy>{author}</cp:lastModifiedBy><cp:revision>{revision}</cp:revision>"
-        "</cp:coreProperties>"
+        f"<dc:title>{title}</dc:title></cp:coreProperties>"
     )
 
 
@@ -2047,6 +2048,15 @@ class FolderRuleTests(OptionTestBase):
         self.assertEqual(result["conflicts"], [])
         self.assertEqual((self.local / "budget.xlsx").read_bytes(), cloud)
 
+    def test_author_priority_never_keeps_a_damaged_version(self):
+        self.rules(authors=("Alice Example", "Bob Example"))
+        damaged = office_file(["Scope"], author="Alice Example").replace(b"Scope", b"Scopf")
+        previous = self.edit_both("report.docx", office_file(["Scope"], author="Bob Example"), damaged)
+
+        result = self.run_pair(previous)
+
+        self.assertEqual(len(result["conflicts"]), 1)
+
     def test_author_priority_with_the_same_author_leaves_the_conflict_open(self):
         self.rules(authors=("Alice Example", "Bob Example"))
         previous = self.edit_both_office("report.docx", "Alice Example", "Alice Example")
@@ -2149,11 +2159,11 @@ class FolderRuleTests(OptionTestBase):
             self.assertTrue(any(field in error for error in errors), (payload, errors))
 
 
-def zip_file(parts):
+def zip_file(parts, compression=zipfile.ZIP_STORED):
     """An Office-style package with the given parts (name -> text or bytes)."""
 
     buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
+    with zipfile.ZipFile(buffer, "w", compression) as archive:
         for name, content in parts.items():
             archive.writestr(name, content)
     return buffer.getvalue()
@@ -2202,6 +2212,7 @@ class SafeRuleTests(OptionTestBase):
     backups = FolderRuleTests.backups
     OLD, NEW = 1700000000, 1700090000
     PNG = b"\x89PNG\r\n\x1a\n picture data \x00\x00\x00\x00IEND\xaeB`\x82"
+    LZMA_ZIP = zip_file({"report.txt": "quarterly figures " * 50}, zipfile.ZIP_LZMA)
 
     def setUp(self):
         super().setUp()
@@ -2262,6 +2273,9 @@ class SafeRuleTests(OptionTestBase):
         self.assertIsNone(self.resolve("d.md", b"Title\n", b"Title\n\xff\n"))
         # Only CRLF and LF end a line; a lone CR inside a quoted CSV field is a value.
         self.assertIsNone(self.resolve("e.csv", b'"A\rB",1\n', b'"A\nB",1\n'))
+        self.assertIsNone(self.resolve("f.csv", b'"A\r\nB",1\n', b'"A\nB",1\n'))
+        # A line added inside a quoted cell changes that cell's value.
+        self.assertIsNone(self.resolve("g.csv", b'"pending\napproved\nreview",1\n', b'"pending\nreview",1\n', self.NEW, self.OLD))
 
     def test_changed_indentation_stays_open(self):
         self.assertIsNone(self.resolve("job.yml", b"steps:\n  run: test\n", b"steps:\nrun: test\n"))
@@ -2283,6 +2297,7 @@ class SafeRuleTests(OptionTestBase):
         two_keys = json.dumps({nfc: 1, nfd: 2}, ensure_ascii=False).encode()
         repeated = ('{"%s": 1, "%s": 2}' % (nfc, nfc)).encode()
         self.assertIsNone(self.resolve("e.json", two_keys, repeated))
+        self.assertIsNone(self.resolve("f.json", b'{"x": 1.25}', b'{"x": "\\u0000fraction:1.25"}'))
 
     def test_empty_or_damaged_file_loses_even_when_it_is_newer(self):
         pdf = b"%PDF-1.7\ncontent\n%%EOF\n"
@@ -2296,6 +2311,8 @@ class SafeRuleTests(OptionTestBase):
             "middle.png": (self.PNG, self.PNG + b" cut off image dat"),
             # The zip directory is intact, but a part's bytes do not match its checksum.
             "checksum.docx": (office_file(["Scope"]), office_file(["Scope"]).replace(b"Scope", b"Scopf")),
+            # Packed data that no longer unpacks.
+            "packed.zip": (self.LZMA_ZIP, self.LZMA_ZIP[:44] + bytes(8) + self.LZMA_ZIP[52:]),
         }
         for name, (intact, damaged) in cases.items():
             with self.subTest(name):
@@ -2303,6 +2320,10 @@ class SafeRuleTests(OptionTestBase):
 
     def test_two_damaged_files_stay_open(self):
         self.assertIsNone(self.resolve("plan.docx", b"not a zip", b"also broken"))
+        # Each copy is damaged in another part; their directories still match.
+        both = office_file(["Scope", "Plan"])
+        local, cloud = both.replace(b"Scope", b"Scopf"), both.replace(b"Plan", b"Plam")
+        self.assertIsNone(self.resolve("both.docx", local, cloud))
 
     def test_files_that_only_look_damaged_stay_open(self):
         # A password-protected Office file is not a zip file, but it is not damaged.
@@ -2317,6 +2338,9 @@ class SafeRuleTests(OptionTestBase):
         self.assertIsNone(self.resolve("song.mp3", song, song[:50_000]))
         # Neither zip file opens, so the longer one is no complete copy either.
         self.assertIsNone(self.resolve("files.zip", b"abcdef", b"abc"))
+        # A zip file can start with another complete one and still hide its files.
+        first = zip_file({"original.txt": "kept"})
+        self.assertIsNone(self.resolve("archive.zip", first + zip_file({"other.txt": "new"}), first))
 
     def test_zip_files_with_unreadable_names_count_as_damaged_without_stopping_the_sync(self):
         broken = zip_file({"aé.txt": "x"}).replace("é".encode(), b"\xff\xfe")
@@ -2364,6 +2388,12 @@ class SafeRuleTests(OptionTestBase):
         second = zip_file({**picture, slide.format(1): "none", slide.format(2): "image1.png"})
         self.assertIsNone(self.resolve("deck.pptx", first, second))
         # Custom properties (a retention period, a classification) are content.
+        core = "docProps/core.xml"
+        self.assertIsNone(self.resolve("title.docx", word_file(["Scope"], parts={core: core_xml(title="Draft scope")}),
+                                       word_file(["Scope"], parts={core: core_xml(title="Approved scope")})))
+        saved_again = word_file(["Scope"], parts={core: core_xml("Anna", 7, title="Scope")})
+        self.assertEqual(self.resolve("saved.docx", word_file(["Scope"], parts={core: core_xml("Ben", 3, title="Scope")}),
+                                      saved_again), "onedrive")
         custom = "docProps/custom.xml"
         self.assertIsNone(self.resolve("kept.docx", word_file(["Scope"], parts={custom: "1 year"}),
                                        word_file(["Scope"], parts={custom: "10 years"})))

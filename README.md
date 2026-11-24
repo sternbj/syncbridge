@@ -29,16 +29,16 @@ deletions, and stops to ask whenever something could lose data.
   first (with "delete permanently" it is not kept). "Safe cases" need no judgement: one
   version is shown to be damaged (an empty picture, video or Office file, an Office or zip
   file that does not open or fails its checksums, a PDF or PNG without its end; a
-  password-protected Office file is not damaged), one picture, video or zip file is an
-  interrupted copy of the other (not MP3: a shortened song can look the same), or the newer
+  password-protected Office file is not damaged), one picture or video is an interrupted
+  copy of the other (not MP3: a shortened song can look the same), or the newer
   version has the same content or only adds to the older one. Same content means: an Office
-  file saved again where only its save details (author, revision, dates) differ, custom
-  properties count; a text file with other line endings, BOM or accent
+  file saved again where only its save details (author, revision, dates, statistics) differ;
+  title, subject and custom properties count; a text file (not CSV) with other line endings, BOM or accent
   storage (trailing spaces and blank lines count); JSON with the same data in another
-  layout. Only adding means: plain text (`.txt`, `.md`, `.csv`, `.log`) with lines inserted
+  layout. Only adding means: plain text (`.txt`, `.md`, `.log`) with lines inserted
   and none changed or removed. Everything else stays open, also name conflicts, deletions,
   same-second saves and dates in the future (a wrong clock), which never count as newer.
-  A damaged version loses whatever its date.
+  A damaged version loses whatever its date, and author priority never keeps one.
   A text file that stops in the middle of a line the other version continues is shown as
   "looks cut off", but stays yours to decide.
 - **Conflict window** with modification dates, sizes, a short diff for text files and

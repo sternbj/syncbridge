@@ -16,6 +16,7 @@ import fcntl
 import fnmatch
 import hashlib
 import json
+import lzma
 import os
 import shutil
 import subprocess
@@ -29,6 +30,7 @@ import zlib
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -1339,9 +1341,14 @@ OFFICE_TEXT_PARTS = {
     ".xlsx": (("xl/worksheets/",), "c"),
 }
 EXCEL_STRINGS_PART = "xl/sharedStrings.xml"
-# Save details of an Office file (author, revision, dates, editing time); saving again
-# changes only these. Custom properties (docProps/custom.xml) are content.
-OFFICE_METADATA_PARTS = ("docProps/core.xml", "docProps/app.xml")
+# The document properties of an Office file. Saving again changes only the save details
+# in them (author, revision, dates, statistics); title, subject, company and the custom
+# properties (docProps/custom.xml) are content.
+OFFICE_PROPERTY_PARTS = ("docProps/core.xml", "docProps/app.xml")
+OFFICE_SAVE_DETAILS = {
+    "lastModifiedBy", "revision", "modified", "lastPrinted", "TotalTime", "Application", "AppVersion",
+    "Pages", "Words", "Characters", "CharactersWithSpaces", "Lines", "Paragraphs", "Slides", "Notes",
+}
 # A password-protected Office file is no zip package but an OLE file starting with this.
 OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 # Media files that are never empty; a shorter copy that matches the start of the other
@@ -1351,18 +1358,20 @@ MEDIA_SUFFIXES = {
     ".mp4", ".mov", ".m4v", ".mp3", ".m4a", ".wav", ".zip",
 }
 NEVER_EMPTY_SUFFIXES = MEDIA_SUFFIXES | set(OFFICE_TEXT_PARTS) | {".pdf", ".png"}
-# An MP3 cut at a frame boundary is the beginning of the full song and still plays.
-INTERRUPTED_COPY_SUFFIXES = MEDIA_SUFFIXES - {".mp3"}
+# An MP3 cut at a frame boundary is the beginning of the full song and still plays; a zip
+# file can start with another complete one and hide its files behind a new directory.
+INTERRUPTED_COPY_SUFFIXES = MEDIA_SUFFIXES - {".mp3", ".zip"}
 # Larger files are not compared byte by byte when looking for an interrupted copy.
 INCOMPLETE_COPY_LIMIT = 512 * 1024 * 1024
 PNG_END = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 # Text formats where inserted lines only add; in code or settings an added line can
-# change what the existing lines mean (a repeated key, an early return).
-ADDITIVE_TEXT_SUFFIXES = {".txt", ".md", ".csv", ".log"}
+# change what the existing lines mean (a repeated key, an early return), in CSV a line
+# can belong to a quoted cell.
+ADDITIVE_TEXT_SUFFIXES = {".txt", ".md", ".log"}
+# Line endings inside a quoted CSV cell are part of its value, so CSV is never "the same".
+NO_TEXT_COMPARISON_SUFFIXES = {".csv"}
 # Reading a zip file that is damaged inside, or whose names are no valid text.
-ZIP_ERRORS = (zipfile.BadZipFile, ValueError, EOFError, zlib.error)
-# Marks a JSON number with a fraction, kept as written: float() rounds 1.00000000000000001 to 1.0.
-JSON_FRACTION = "\0fraction:"
+ZIP_ERRORS = (zipfile.BadZipFile, ValueError, EOFError, zlib.error, lzma.LZMAError)
 
 
 def xml_local_name(tag: str) -> str:
@@ -1504,11 +1513,11 @@ def is_incomplete_copy(short: Path, full: Path) -> bool:
     """True when the media file `short` is only the beginning of `full`, as after an
     interrupted copy, and `full` is not damaged itself."""
 
-    if short.suffix.lower() not in INTERRUPTED_COPY_SUFFIXES or file_health(full) == "damaged":
+    if short.suffix.lower() not in INTERRUPTED_COPY_SUFFIXES:
         return False
     try:
         size, full_size = short.stat().st_size, full.stat().st_size
-        if not 0 < size < full_size <= INCOMPLETE_COPY_LIMIT:
+        if not 0 < size < full_size <= INCOMPLETE_COPY_LIMIT or file_health(full) == "damaged":
             return False
         with short.open("rb") as a, full.open("rb") as b:
             while chunk := a.read(1 << 20):
@@ -1536,37 +1545,51 @@ def cut_off_side(paths: dict[str, Path]) -> str | None:
     return None
 
 
-def office_parts(path: Path) -> dict[str, tuple[int, int]] | None:
-    """Checksum and size of every part of an Office file except its save details."""
+def office_parts(path: Path) -> dict[str, object] | None:
+    """Every part of an Office file by checksum and size; the document properties by
+    their values without the save details."""
+
+    def properties(data: bytes) -> list[tuple]:
+        return [
+            (element.tag, (element.text or "").strip(), sorted(element.attrib.items()))
+            for element in ElementTree.fromstring(data).iter()
+            if xml_local_name(element.tag) not in OFFICE_SAVE_DETAILS
+        ]
 
     try:
         with zipfile.ZipFile(path) as archive:
             return {
-                item.filename: (item.CRC, item.file_size)
+                item.filename: properties(archive.read(item))
+                if item.filename in OFFICE_PROPERTY_PARTS
+                else (item.CRC, item.file_size)
                 for item in archive.infolist()
-                if item.filename not in OFFICE_METADATA_PARTS
             }
-    except (OSError, *ZIP_ERRORS):
+    except (OSError, ElementTree.ParseError, *ZIP_ERRORS):
         return None
 
 
-def json_data(path: Path) -> str | None:
-    """The data of a JSON file in one fixed layout, or None when it is no clean JSON
-    (also with a repeated key, where readers disagree on the value)."""
+def json_data(path: Path) -> tuple | None:
+    """The data of a JSON file, comparable whatever the layout and key order, or None
+    when it is no clean JSON (also with a repeated key, where readers disagree)."""
 
     def without_repeated_keys(pairs: list[tuple[str, object]]) -> dict:
         if len({key for key, _ in pairs}) < len(pairs):
             raise ValueError("repeated key")
         return dict(pairs)
 
+    def typed(value: object) -> tuple:
+        # Every value with its type: == alone takes true for 1 and 1 for 1.0.
+        if isinstance(value, dict):
+            return ("object", tuple(sorted((key, typed(item)) for key, item in value.items())))
+        if isinstance(value, list):
+            return ("array", tuple(typed(item) for item in value))
+        return (type(value).__name__, value)
+
     try:
-        data = json.loads(
-            path.read_bytes().decode("utf-8-sig"),
-            object_pairs_hook=without_repeated_keys,
-            parse_float=lambda text: JSON_FRACTION + text,
-        )
-        # dumps tells true from 1 and 1 from 1.0, which == does not.
-        return json.dumps(data, sort_keys=True)
+        # Decimal keeps fractions as written: float() rounds 1.00000000000000001 to 1.0.
+        return typed(json.loads(
+            path.read_bytes().decode("utf-8-sig"), object_pairs_hook=without_repeated_keys, parse_float=Decimal
+        ))
     except (OSError, ValueError, RecursionError):
         return None
 
@@ -1589,7 +1612,8 @@ def same_content(paths: dict[str, Path]) -> bool:
     if suffix == ".json":
         # Not compared as text: storing accents alike could merge two keys into a repeated one.
         return same_known(json_data, paths)
-    return is_text_file(paths["local"].name) and same_known(lambda path: text_lines(path, strict=True), paths)
+    return is_text_file(paths["local"].name) and suffix not in NO_TEXT_COMPARISON_SUFFIXES \
+        and same_known(lambda path: text_lines(path, strict=True), paths)
 
 
 def only_adds(older: list[str], newer: list[str]) -> bool:
@@ -1616,6 +1640,8 @@ def safe_decision(pair: SyncPair, conflict: dict) -> tuple[str | None, str]:
         return None, ""
     if intact := intact_side(paths):
         return intact, "the other version is empty or damaged"
+    if any(file_health(path) == "damaged" for path in paths.values()):
+        return None, ""
     for side in ("local", "onedrive"):
         if is_incomplete_copy(paths[other_side(side)], paths[side]):
             return side, "the other version is an incomplete copy"
@@ -2302,13 +2328,17 @@ def protect_deletions(actions: list[tuple[str, str]]) -> list[tuple[str, str]]:
 def author_decision(pair: SyncPair, rel_path: str) -> str | None:
     """Keep the version saved by the higher-ranked author (Office files only).
 
-    Both authors must be in the list and differ; otherwise nothing is decided.
+    Both authors must be in the list and differ, and neither version may be damaged;
+    otherwise nothing is decided.
     """
 
     ranking = [name.casefold() for name in require_config().author_priority]
     ranks = {}
     for side in ("local", "onedrive"):
-        info = office_info(side_dir(pair, side) / rel_path, content=False)
+        path = side_dir(pair, side) / rel_path
+        if file_health(path) == "damaged":
+            return None
+        info = office_info(path, content=False)
         author = (info or {}).get("author") or ""
         if author.strip().casefold() not in ranking:
             return None
